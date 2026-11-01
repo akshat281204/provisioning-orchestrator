@@ -245,3 +245,33 @@ func TestOperationKey(t *testing.T) {
 		t.Fatalf("OperationKey = %q, want %q", got, want)
 	}
 }
+
+// readyOnlyThroughVerification pins the phase-6 invariant: the only ordinary
+// edge into `ready` is verifying -> ready (and rotating -> ready, when a
+// rotation completes). Any other direct transition must be rejected, so
+// `ready` can never be claimed except through the state machinery of the
+// verification (or rotation) step. The one other sanctioned edge,
+// in_doubt -> ready, stays reserved for the ambiguity reconciliation in
+// phase 7 (see docs/design.md); it is not reachable by the phase-6 code
+// paths, all of which door through verification.
+func TestReadyOnlyThroughVerification(t *testing.T) {
+	for _, s := range []EnvState{EnvPending, EnvProvisioning, EnvRollingBack,
+		EnvCancelling, EnvFailed, EnvCancelled, EnvDeleted, EnvRolledBack} {
+		if s.CanTransitionTo(EnvReady) {
+			t.Errorf("%q must not be able to transition directly to ready", s)
+		}
+	}
+	// The two sanctioned producers of ready.
+	if !EnvVerifying.CanTransitionTo(EnvReady) {
+		t.Error("verifying -> ready must be legal: it is how provable readiness is recorded")
+	}
+	if !EnvRotating.CanTransitionTo(EnvReady) {
+		t.Error("rotating -> ready must be legal: it is how a completed rotation is recorded")
+	}
+	// A transition helper must refuse an illegal move and write nothing.
+	for _, s := range []EnvState{EnvPending, EnvProvisioning, EnvCancelled} {
+		if _, err := Transition(s, EnvReady); err == nil {
+			t.Errorf("Transition(%q, ready) succeeded; the state machine must reject it", s)
+		}
+	}
+}

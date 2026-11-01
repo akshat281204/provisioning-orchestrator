@@ -41,16 +41,22 @@ func newWorkerPool(
 	roles := adapters.NewLocalRoles(pool, cfg.DatabaseURL, log)
 	secrets := adapters.NewVaultSecrets(vaultClient, "secret")
 	secrets.Log = log
+	// The orchestrator store is the state machine's window for the worker:
+	// verification drives pending/provisioning/verifying forward, and only
+	// the store's CompleteVerification transaction can write `ready`.
+	st := store.NewPostgresStore(pool)
 	return &worker.Pool{
 		Concurrency:   cfg.WorkerConcurrency,
 		LeaseDuration: cfg.LeaseDuration,
 		StepTimeout:   cfg.StepTimeout,
-		Store:         store.NewPostgresStore(pool),
+		Store:         st,
 		Executor: &worker.AdapterExecutor{
 			Capacity:  capacity,
 			Databases: databases,
 			Roles:     roles,
 			Secrets:   secrets,
+			Verifier:  adapters.NewLocalVerifier(cfg.DatabaseURL),
+			Envs:      st,
 		},
 		Log: log,
 	}
@@ -107,6 +113,13 @@ func New(ctx context.Context, cfg config.Config, log *slog.Logger) (*App, error)
 	// The /v1 surface is served by its own package against the same pool a
 	// worker (later phases) will claim work from.
 	v1 := httpapi.New(store.NewPostgresStore(pool))
+	v1.AttachCredentials(
+		adapters.NewVaultSecrets(vaultClient, "secret"),
+		adapters.NewLocalRoles(pool, cfg.DatabaseURL, log),
+		adapters.NewLocalVerifier(cfg.DatabaseURL),
+		httpapi.NewCredentialPolicy(cfg.CredentialCallers...),
+		log,
+	)
 	mux.Handle("/v1/", http.StripPrefix("/v1", v1.Handler()))
 
 	a.server = &http.Server{

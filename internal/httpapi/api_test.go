@@ -24,6 +24,11 @@ type fakeStore struct {
 	envs  map[string]domain.Environment
 	byKey map[string]string // tenant+"\x00"+idempotency_key -> environment id
 	steps map[string][]domain.Step
+	// rotation lock bookkeeping: one held/holder pair per environment.
+	locks map[string]*sync.Mutex
+	held  map[string]bool
+	// completeRotationHook, when set, fails every CompleteRotation call.
+	completeRotationHook func() error
 }
 
 func newFakeStore() *fakeStore {
@@ -31,6 +36,8 @@ func newFakeStore() *fakeStore {
 		envs:  map[string]domain.Environment{},
 		byKey: map[string]string{},
 		steps: map[string][]domain.Step{},
+		locks: map[string]*sync.Mutex{},
+		held:  map[string]bool{},
 	}
 }
 
@@ -93,6 +100,81 @@ func (f *fakeStore) ListForEnvironment(_ context.Context, environmentID string) 
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]domain.Step(nil), f.steps[environmentID]...), nil
+}
+
+// TransitionEnvironment CAS-moves the environment's state in memory.
+func (f *fakeStore) TransitionEnvironment(_ context.Context, environmentID string, target domain.EnvState) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	env, ok := f.envs[environmentID]
+	if !ok {
+		return fmt.Errorf("fake: transition %s: %w", environmentID, store.ErrNotFound)
+	}
+	if !env.State.CanTransitionTo(target) {
+		return fmt.Errorf("fake: transition %s: illegal %q -> %q", environmentID, env.State, target)
+	}
+	env.State = target
+	f.envs[environmentID] = env
+	return nil
+}
+
+// CompleteRotation flips rotating -> ready in memory. completeRotationHook,
+// when set, fails it — tests use it to exercise the resumable bookkeeping
+// failure path.
+func (f *fakeStore) CompleteRotation(_ context.Context, environmentID string, _ []byte) error {
+	f.mu.Lock()
+	env, ok := f.envs[environmentID]
+	var hookErr bool
+	if f.completeRotationHook != nil {
+		hookErr = true
+	}
+	f.mu.Unlock()
+	if !ok || env.State != domain.EnvRotating {
+		return fmt.Errorf("fake: complete rotation %s: not rotating", environmentID)
+	}
+	if hookErr {
+		return f.completeRotationHook()
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	env.State = domain.EnvReady
+	f.envs[environmentID] = env
+	return nil
+}
+
+// AcquireRotationLock mirrors the database's advisory lock: one holder per
+// environment; a loser is refused with store.ErrRotationBusy. The paired
+// mutex additionally serializes genuinely overlapping in-process attempts.
+
+func (f *fakeStore) AcquireRotationLock(_ context.Context, environmentID string) (func() error, error) {
+	f.mu.Lock()
+	if f.locks == nil {
+		f.locks = map[string]*sync.Mutex{}
+	}
+	if f.held == nil {
+		f.held = map[string]bool{}
+	}
+	m, ok := f.locks[environmentID]
+	if !ok {
+		m = &sync.Mutex{}
+		f.locks[environmentID] = m
+	}
+	held := f.held[environmentID]
+	if !held {
+		f.held[environmentID] = true
+	}
+	f.mu.Unlock()
+	if held {
+		return nil, fmt.Errorf("fake: acquire rotation lock %s: %w", environmentID, store.ErrRotationBusy)
+	}
+	m.Lock() // serialize genuinely overlapping attempts in-process
+	return func() error {
+		m.Unlock()
+		f.mu.Lock()
+		f.held[environmentID] = false
+		f.mu.Unlock()
+		return nil
+	}, nil
 }
 
 func (f *fakeStore) envCount() int {

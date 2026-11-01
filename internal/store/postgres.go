@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -23,6 +24,8 @@ type PostgresStore struct {
 var (
 	_ EnvironmentStore = (*PostgresStore)(nil)
 	_ StepStore        = (*PostgresStore)(nil)
+	_ LeaseStore       = (*PostgresStore)(nil)
+	_ StateStore       = (*PostgresStore)(nil)
 )
 
 // NewPostgresStore builds a store on top of an existing pool. The caller
@@ -420,4 +423,361 @@ ORDER BY step_index`, environmentID)
 		return nil, fmt.Errorf("store: iterate steps for %s: %w", environmentID, err)
 	}
 	return steps, nil
+}
+
+// ---- Environment state machine (phase 6) ----
+
+// transitionEnv is the atomic hop shared by every state move: read the
+// persisted state, validate the edge against the domain transition table,
+// then CAS-update on the state just read so a concurrent winner makes this
+// writer a no-op instead of a second illegal move.
+func (s *PostgresStore) transitionEnv(
+	ctx context.Context, environmentID string, current, target domain.EnvState,
+) error {
+	if !domain.CanTransition(current, target) {
+		return fmt.Errorf("store: transition environment %s: illegal %q -> %q",
+			environmentID, current, target)
+	}
+	tag, err := s.pool.Exec(ctx, `
+UPDATE environments
+SET state = $2, updated_at = now()
+WHERE id = $1 AND state = $3`, environmentID, string(target), string(current))
+	if err != nil {
+		return fmt.Errorf("store: transition environment %s to %s: %w", environmentID, target, err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("store: transition environment %s to %s: state moved while transitioning",
+			environmentID, target)
+	}
+	return nil
+}
+
+// envStateFor reads one environment's state; unknown ids wrap ErrNotFound.
+func (s *PostgresStore) envStateFor(ctx context.Context, environmentID string) (domain.EnvState, error) {
+	var state string
+	if err := s.pool.QueryRow(ctx,
+		`SELECT state FROM environments WHERE id = $1`, environmentID).Scan(&state); err != nil {
+		return "", mapError(fmt.Sprintf("store: read state of %s", environmentID), err)
+	}
+	st := domain.EnvState(state)
+	if !st.Valid() {
+		return "", fmt.Errorf("store: read state of %s: unknown persisted state %q", environmentID, state)
+	}
+	return st, nil
+}
+
+// BeginProvisioning moves pending -> provisioning. Already-provisioning
+// environments pass through unchanged.
+func (s *PostgresStore) BeginProvisioning(ctx context.Context, environmentID string) error {
+	state, err := s.envStateFor(ctx, environmentID)
+	if err != nil {
+		return err
+	}
+	if state == domain.EnvProvisioning {
+		return nil
+	}
+	if err := s.transitionEnv(ctx, environmentID, state, domain.EnvProvisioning); err != nil {
+		return err
+	}
+	return nil
+}
+
+// BeginVerification walks pending -> provisioning -> verifying. Monitoring
+// the environment as `verifying` while the probe runs gives every sibling
+// (the HTTP surface, cleanup) a truthful answer about what is underway.
+func (s *PostgresStore) BeginVerification(ctx context.Context, environmentID string) error {
+	for {
+		state, err := s.envStateFor(ctx, environmentID)
+		if err != nil {
+			return err
+		}
+		switch state {
+		case domain.EnvVerifying:
+			return nil
+		case domain.EnvPending:
+			if err := s.transitionEnv(ctx, environmentID, state, domain.EnvProvisioning); err != nil {
+				return err
+			}
+		case domain.EnvProvisioning:
+			if err := s.transitionEnv(ctx, environmentID, state, domain.EnvVerifying); err != nil {
+				return err
+			}
+		default:
+			return fmt.Errorf("store: begin verification %s: from %q the probe step may not run",
+				environmentID, state)
+		}
+	}
+}
+
+// rotationLockWait bounds how long a caller may wait for the lock before
+// being told the environment is busy; rotationTryInterval spaces the
+// non-blocking attempts.
+const (
+	rotationLockWait    = 5 * time.Second
+	rotationTryInterval = 50 * time.Millisecond
+)
+
+// tryAdvisoryLock / unlockAdvisoryLock use the non-blocking variant so the
+// outcome is unambiguous: an attempt either returns a definite true/false,
+// or the whole connection is not trustworthy and is destroyed. A cancellable
+// blocking pg_advisory_lock cannot give the same guarantee — after
+// pgx returns a context error, the server may have granted the lock on the
+// (pooled, still-open) session, and a released-not-closed connection would
+// leak the lock into the pool, bricking every later rotation with
+// ErrRotationBusy.
+const tryAdvisoryLockSQL = `SELECT pg_try_advisory_lock(hashtextextended($1, 0))`
+const unlockAdvisoryLockSQL = `SELECT pg_advisory_unlock(hashtextextended($1, 0))`
+
+// destroyRotationConn removes a connection from the pool and closes the
+// network session, dropping every session-level lock it holds. This is the
+// only safe answer to "I do not know whether this session holds the lock".
+func destroyRotationConn(ctx context.Context, conn *pgxpool.Conn) {
+	if pgxConn := conn.Hijack(); pgxConn != nil {
+		_ = pgxConn.Close(context.WithoutCancel(ctx))
+	}
+}
+
+// acquireRotationSession takes a dedicated connection and waits on it with
+// the non-blocking try-lock loop. It reports ErrRotationBusy only after the
+// caller's own context (capped at rotationLockWait) expires while no attempt
+// has ever come back ambiguous; any driver-level error destroys the
+// connection and surfaces as a real error, never as "busy".
+func (s *PostgresStore) acquireRotationSession(
+	ctx context.Context, environmentID string,
+) (*pgxpool.Conn, error) {
+	conn, err := s.pool.Acquire(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("store: acquire rotation lock %s: %w", environmentID, err)
+	}
+	// A pooled connection returns to the pool unchanged unless destroyed
+	// explicitly below; plain Release is safe on paths where the lock was
+	// never (and provably never) granted.
+	wctx, wcancel := context.WithTimeout(ctx, rotationLockWait)
+	defer wcancel()
+	timer := time.NewTimer(0)
+	defer timer.Stop()
+	for {
+		var locked bool
+		if err := conn.QueryRow(wctx, tryAdvisoryLockSQL, environmentID).Scan(&locked); err != nil {
+			// The attempt's outcome is unknown: the server may hold the lock
+			// on this session. Destroy, never release.
+			destroyRotationConn(ctx, conn)
+			return nil, fmt.Errorf("store: acquire rotation lock %s: %w", environmentID, err)
+		}
+		if locked {
+			return conn, nil
+		}
+		timer.Reset(rotationTryInterval)
+		select {
+		case <-timer.C:
+		case <-wctx.Done():
+			// No attempt ever reported a lock, so nothing is held: the
+			// connection is clean and the caller is free to retry later.
+			conn.Release()
+			return nil, fmt.Errorf("store: acquire rotation lock %s: %w", environmentID, ErrRotationBusy)
+		}
+	}
+}
+
+// AcquireRotationLock takes the per-environment rotation lock: a session-level
+// Postgres advisory lock keyed to the environment id. Rotation mutates Vault
+// and the role in several adapter calls that cannot be one transaction, so
+// serialization happens here: while this lock is held, no other request
+// (in this process or another) writes a new password for the environment, and
+// the last writer is provably the stored one.
+//
+// It returns the release function, which must be called exactly once; its
+// error MUST be surfaced, because a failed release means the connection
+// holding the lock was destroyed to protect the pool. A caller who could not
+// take the lock in time receives an error wrapping ErrRotationBusy — the
+// client retry will resume the rotation under the lock rather than race it.
+func (s *PostgresStore) AcquireRotationLock(
+	ctx context.Context, environmentID string,
+) (func() error, error) {
+	conn, err := s.acquireRotationSession(ctx, environmentID)
+	if err != nil {
+		return nil, err
+	}
+	return func() error {
+		nctx, ncancel := context.WithTimeout(context.WithoutCancel(ctx), rotationLockWait)
+		defer ncancel()
+		// Defensively unlock before the connection returns to the pool and
+		// check that the lock was ours: pg_advisory_unlock answers true only
+		// when this session actually held it.
+		var unlocked bool
+		if err := conn.QueryRow(nctx, unlockAdvisoryLockSQL, environmentID).Scan(&unlocked); err != nil || !unlocked {
+			// The outcome is again unknown or unowned: the lock may survive
+			// on a pooled session, so the connection is destroyed, NOT
+			// released — Release would hand the lock back into the pool.
+			destroyRotationConn(ctx, conn)
+			return fmt.Errorf("store: release rotation lock %s: unlocked=%t: %w",
+				environmentID, unlocked, err)
+		}
+		conn.Release()
+		return nil
+	}, nil
+}
+
+// TransitionEnvironment CAS-moves an environment to `target`. It is the API
+// surface for operator-driven moves (rotation start and failure); `ready` is
+// rejected here because the only legitimate producers of ready are the
+// CompleteVerification and CompleteRotation transactions.
+func (s *PostgresStore) TransitionEnvironment(
+	ctx context.Context, environmentID string, target domain.EnvState,
+) error {
+	if target == domain.EnvReady {
+		return fmt.Errorf("store: transition environment %s: ready is only reachable through a completed verification",
+			environmentID)
+	}
+	state, err := s.envStateFor(ctx, environmentID)
+	if err != nil {
+		return err
+	}
+	if state == target {
+		return nil
+	}
+	return s.transitionEnv(ctx, environmentID, state, target)
+}
+
+// WriteConnectionMeta merges the non-secret connection facts into the
+// environment's metadata. The jsonb merge keeps any other metadata keys
+// intact; only identifiers land here, never credential material.
+func (s *PostgresStore) WriteConnectionMeta(
+	ctx context.Context, environmentID string, meta []byte,
+) error {
+	tag, err := s.pool.Exec(ctx, `
+UPDATE environments
+SET metadata = metadata || $2::jsonb, updated_at = now()
+WHERE id = $1`, environmentID, string(meta))
+	if err != nil {
+		return fmt.Errorf("store: write connection metadata for %s: %w", environmentID, err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("store: write connection metadata for %s: %w", environmentID, ErrNotFound)
+	}
+	return nil
+}
+
+// CompleteVerification is the readiness gate's final move: the verification
+// step is recorded done under its lease and the environment's state becomes
+// ready in the SAME transaction. There is no code path that writes `ready`
+// outside this one, so a successful probe is provably what made the
+// environment ready and nothing else ever can.
+func (s *PostgresStore) CompleteVerification(
+	ctx context.Context, stepID, owner, environmentID string,
+) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("store: complete verification %s: begin: %w", stepID, err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	tag, err := tx.Exec(ctx, `
+UPDATE workflow_steps
+SET state = 'done',
+    last_error = '',
+    lease_owner = NULL,
+    lease_expires_at = NULL,
+    updated_at = now()
+WHERE id = $1 AND lease_owner = $2 AND state = 'running'`, stepID, owner)
+	if err != nil {
+		return fmt.Errorf("store: complete verification step %s: %w", stepID, err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("store: complete verification step %s for %s: not held: %w", stepID, owner, ErrNotFound)
+	}
+
+	tag, err = tx.Exec(ctx, `
+UPDATE environments
+SET state = 'ready', updated_at = now()
+WHERE id = $1 AND state = 'verifying'`, environmentID)
+	if err != nil {
+		return fmt.Errorf("store: complete verification of environment %s: %w", environmentID, err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf(
+			"store: complete verification of environment %s: environment is not verifying; ready cannot be granted",
+			environmentID)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("store: complete verification %s: commit: %w", stepID, err)
+	}
+	return nil
+}
+
+// rotationEntry is one line in the verify step's rotation log.
+type rotationEntry struct {
+	At string `json:"at"`
+	By string `json:"by"`
+}
+
+// CompleteRotation records one rotation (at/by entry) on the verify step's
+// metadata and flips rotating -> ready in one transaction. The metadata is
+// merged (jsonb_set), so any other keys already on the verify step's
+// document survive; a verify step that does not exist fails the whole
+// transaction — a rotation is never "recorded" against nothing.
+func (s *PostgresStore) CompleteRotation(
+	ctx context.Context, environmentID string, entry []byte,
+) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("store: complete rotation for %s: begin: %w", environmentID, err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var cur []byte
+	err = tx.QueryRow(ctx, `
+SELECT metadata FROM workflow_steps
+WHERE environment_id = $1 AND kind = $2
+FOR UPDATE`, environmentID, string(domain.KindVerifyUsable)).Scan(&cur)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return fmt.Errorf("store: read rotation metadata for %s: no verification step exists: %w",
+			environmentID, ErrNotFound)
+	}
+	if err != nil {
+		return fmt.Errorf("store: read rotation metadata for %s: %w", environmentID, err)
+	}
+
+	var record struct {
+		Rotations []rotationEntry `json:"rotations"`
+	}
+	if len(cur) > 0 {
+		if err := json.Unmarshal(cur, &record); err != nil {
+			return fmt.Errorf("store: parse rotation metadata for %s: %w", environmentID, err)
+		}
+	}
+	var e rotationEntry
+	if err := json.Unmarshal(entry, &e); err != nil {
+		return fmt.Errorf("store: parse rotation entry for %s: %w", environmentID, err)
+	}
+	record.Rotations = append(record.Rotations, e)
+	rotations, err := json.Marshal(record.Rotations)
+	if err != nil {
+		return fmt.Errorf("store: marshal rotation metadata for %s: %w", environmentID, err)
+	}
+
+	if _, err := tx.Exec(ctx, `
+UPDATE workflow_steps
+SET metadata = jsonb_set(metadata, '{rotations}', $2::jsonb, true),
+    updated_at = now()
+WHERE environment_id = $1 AND kind = $3`,
+		environmentID, string(rotations), string(domain.KindVerifyUsable)); err != nil {
+		return fmt.Errorf("store: record rotation for %s: %w", environmentID, err)
+	}
+
+	tag, err := tx.Exec(ctx, `
+UPDATE environments SET state = 'ready', updated_at = now()
+WHERE id = $1 AND state = 'rotating'`, environmentID)
+	if err != nil {
+		return fmt.Errorf("store: complete rotation of environment %s: %w", environmentID, err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("store: complete rotation of environment %s: environment is not rotating", environmentID)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("store: complete rotation for %s: commit: %w", environmentID, err)
+	}
+	return nil
 }

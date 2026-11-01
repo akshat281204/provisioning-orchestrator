@@ -10,10 +10,12 @@ import (
 
 	"github.com/akshat281204/provisioning-orchestrator/internal/app"
 	"github.com/akshat281204/provisioning-orchestrator/internal/config"
+	"github.com/akshat281204/provisioning-orchestrator/internal/telemetry"
 )
 
 func main() {
-	log := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	log := slog.New(telemetry.NewRedactingHandler(
+		slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo})))
 
 	cfg, err := config.Load()
 	if err != nil {
