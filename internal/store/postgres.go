@@ -86,8 +86,26 @@ func scanEnvInto(row pgx.Row) (domain.Environment, error) {
 // Create persists a new environment. A (tenant_id, idempotency_key) collision
 // returns an error wrapping ErrDuplicate.
 func (s *PostgresStore) Create(ctx context.Context, env domain.Environment) (domain.Environment, error) {
+	params, err := envParams(env)
+	if err != nil {
+		return domain.Environment{}, fmt.Errorf("store: environment create: %w", err)
+	}
+	row := s.pool.QueryRow(ctx, `
+INSERT INTO environments (id, tenant_id, name, state, idempotency_key, spec, metadata, expires_at)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+RETURNING `+envColumns, params...)
+	created, err := scanEnvInto(row)
+	if err != nil {
+		return domain.Environment{}, mapError("store: environment create", err)
+	}
+	return created, nil
+}
+
+// envParams normalises the environment insert values shared by every create
+// path: defaulted state, non-nil JSONB columns, and a parsed expires_at.
+func envParams(env domain.Environment) ([]any, error) {
 	if env.ID == "" {
-		return domain.Environment{}, fmt.Errorf("store: environment create: id is required")
+		return nil, fmt.Errorf("id is required")
 	}
 	if env.State == "" {
 		env.State = domain.EnvPending
@@ -102,23 +120,12 @@ func (s *PostgresStore) Create(ctx context.Context, env domain.Environment) (dom
 	if env.ExpiresAt != "" {
 		t, err := time.Parse(time.RFC3339, env.ExpiresAt)
 		if err != nil {
-			return domain.Environment{}, fmt.Errorf("store: environment create: parse expires_at %q: %w", env.ExpiresAt, err)
+			return nil, fmt.Errorf("parse expires_at %q: %w", env.ExpiresAt, err)
 		}
 		expAt = t
 	}
-
-	row := s.pool.QueryRow(ctx, `
-INSERT INTO environments (id, tenant_id, name, state, idempotency_key, spec, metadata, expires_at)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-RETURNING `+envColumns,
-		env.ID, env.TenantID, env.Name, string(env.State), env.IdempotencyKey,
-		env.Spec, env.Metadata, expAt)
-
-	created, err := scanEnvInto(row)
-	if err != nil {
-		return domain.Environment{}, mapError("store: environment create", err)
-	}
-	return created, nil
+	return []any{env.ID, env.TenantID, env.Name, string(env.State), env.IdempotencyKey,
+		env.Spec, env.Metadata, expAt}, nil
 }
 
 // Get returns one environment by id; a missing id returns ErrNotFound.
@@ -159,6 +166,18 @@ func (s *PostgresStore) CreatePlan(ctx context.Context, environmentID string, st
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
+	if err := insertPlan(ctx, tx, environmentID, steps); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("store: create plan for %s: commit: %w", environmentID, err)
+	}
+	return nil
+}
+
+// insertPlan writes every planned step row on an open transaction. Any
+// (environment_id, step_index) collision maps to ErrDuplicate.
+func insertPlan(ctx context.Context, tx pgx.Tx, environmentID string, steps []domain.PlannedStep) error {
 	for _, step := range steps {
 		opKey := domain.OperationKey(environmentID, step.Index, step.Kind)
 		if _, err := tx.Exec(ctx, `
@@ -168,10 +187,45 @@ VALUES (gen_random_uuid(), $1, $2, $3, $4, $5)`,
 			return mapError(fmt.Sprintf("store: create plan for %s (step %d)", environmentID, step.Index), err)
 		}
 	}
-	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("store: create plan for %s: commit: %w", environmentID, err)
-	}
 	return nil
+}
+
+// CreateEnvironmentWithPlan inserts the environment and its entire step plan
+// in one transaction, so an environment can never exist without a workflow
+// and never exists with a half-written plan. A (tenant_id, idempotency_key)
+// or (environment_id, step_index) collision returns an error wrapping
+// ErrDuplicate and writes nothing.
+func (s *PostgresStore) CreateEnvironmentWithPlan(
+	ctx context.Context, env domain.Environment, steps []domain.PlannedStep,
+) (domain.Environment, error) {
+	params, err := envParams(env)
+	if err != nil {
+		return domain.Environment{}, fmt.Errorf("store: create environment %s with plan: %w", env.ID, err)
+	}
+	if len(steps) == 0 {
+		return domain.Environment{}, fmt.Errorf("store: create environment %s with plan: empty plan", env.ID)
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return domain.Environment{}, fmt.Errorf("store: create environment %s with plan: begin: %w", env.ID, err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	row := tx.QueryRow(ctx, `
+INSERT INTO environments (id, tenant_id, name, state, idempotency_key, spec, metadata, expires_at)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+RETURNING `+envColumns, params...)
+	created, err := scanEnvInto(row)
+	if err != nil {
+		return domain.Environment{}, mapError(fmt.Sprintf("store: create environment %s with plan", env.ID), err)
+	}
+	if err := insertPlan(ctx, tx, created.ID, steps); err != nil {
+		return domain.Environment{}, fmt.Errorf("store: create environment %s with plan: %w", env.ID, err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return domain.Environment{}, fmt.Errorf("store: create environment %s with plan: commit: %w", env.ID, err)
+	}
+	return created, nil
 }
 
 // ListForEnvironment returns the steps of an environment ordered by

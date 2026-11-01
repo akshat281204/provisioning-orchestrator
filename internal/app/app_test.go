@@ -120,6 +120,26 @@ func TestReadyEndpointSucceedsOnlyWhenAllDependenciesPass(t *testing.T) {
 	}
 }
 
+// TestV1SurfaceIsMounted checks the /v1 mux wiring end to end: the route is
+// reachable through the real server handler (no database is needed for a
+// validation-only response, so this runs offline).
+func TestV1SurfaceIsMounted(t *testing.T) {
+	a := newTestApp(t, slog.New(slog.DiscardHandler))
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/environments", strings.NewReader(`{"tenantId":"t","name":"n","spec":{}}`))
+	a.server.Handler.ServeHTTP(rec, req)
+
+	// No Idempotency-Key: the contract demands 400 with a JSON error body
+	// and no writes; a 404 here would mean the mount was dropped.
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for a POST without Idempotency-Key, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"error"`) {
+		t.Fatalf("expected the JSON error envelope, got %s", rec.Body.String())
+	}
+}
+
 func TestRequestLoggerNeverLogsCredentials(t *testing.T) {
 	var buf bytes.Buffer
 	log := slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo}))
