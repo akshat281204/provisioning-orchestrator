@@ -1,7 +1,7 @@
 ---
 description: Implements exactly one phase of plan/. The driver owns git — never commit, push, or rebase.
 mode: primary
-model: opencode-go/glm-5.3
+model: opencode-go/glm-5.3#low
 permissions:
   - action: "*"
     resource: "*"

@@ -33,7 +33,10 @@ everything downstream.
 ## Scope
 
 Review only `git diff <base>...HEAD`. That is this phase's own work. Do not review the
-rest of the repository and do not ask for unrelated improvements.
+rest of the repository and do not ask for unrelated improvements. Read only the attached
+phase spec and files changed in that diff; do not glob or search unrelated `plan/` or
+`docs/` files. If a changed file needs context, use the attached spec rather than browsing
+the repository.
 
 ## What counts as BLOCKING
 
