@@ -1,12 +1,17 @@
 # Architecture and durability model
 
+This document is the narrative overview. The normative rules — exact states and legal
+transitions, retry/reconciliation, authorization, secret handling, persistence, and the
+`/v1` API — are in [`design.md`](design.md). If a narrative example here differs from that
+contract, the contract wins.
+
 ## The problem shape
 
 Provisioning an environment is a multi-step, side-effecting workflow against stateful
 external systems:
 
 ```
-create_database → create_role → grant_privileges → store_credentials → verify_usable
+reserve_capacity → create_database → store_credentials → create_role → grant_privileges → verify_usable
 ```
 
 Each step:
@@ -17,48 +22,39 @@ Each step:
 
 A crash, a duplicate delivery, or a network partition at any point can leave the
 orchestrator believing something different from reality. The design goal is that **the
-database row and the outside world converge**, without human intervention and without
-creating duplicate resources.
+database row and the outside world converge** automatically when reality can be reconciled,
+without creating duplicate resources; irreconcilable conflicts remain visible for operator
+attention.
 
 ## Durable execution: steps are rows, not stack frames
 
 An in-process workflow (goroutines, channels, function calls) loses all progress when the
-process dies. Instead, every step is a row:
-
-```sql
-create table provisioning_steps (
-    id              uuid primary key,
-    environment_id  uuid not null references environments(id),
-    step_index      int  not null,
-    kind            text not null,
-    state           text not null,          -- pending | running | in_doubt | done | failed | compensated
-    attempts        int  not null default 0,
-    lease_owner     text,
-    lease_expires_at timestamptz,
-    last_error      text,
-    unique (environment_id, step_index)
-);
-```
-
-Progress is a state transition on a row, committed in the same transaction that records
-the effect. A worker that dies between steps loses nothing: the row still says
-`step 3 pending`.
+process dies. The environment and its ordered workflow steps are durable rows. A worker
+commits intent/progress around external effects, but an external system and Postgres cannot
+share a transaction. A crash can therefore leave the effect and row out of sync; the next
+worker consults the contract's idempotency and reconciliation rules rather than assuming
+exactly-once execution.
 
 ## Claiming: leases, not locks
 
 ```sql
-update provisioning_steps
+update workflow_steps
    set state = 'running',
        lease_owner = $1,
        lease_expires_at = now() + $2::interval,
        attempts = attempts + 1
  where id = (
-     select id from provisioning_steps
-      where state = 'pending'
-         or (state = 'running' and lease_expires_at < now())
-      order by step_index
-      for update skip locked
-      limit 1
+      select candidate.id from workflow_steps candidate
+       where candidate.state = 'pending'
+         and not exists (
+             select 1 from workflow_steps predecessor
+              where predecessor.environment_id = candidate.environment_id
+                and predecessor.step_index < candidate.step_index
+                and predecessor.state not in ('done', 'compensated')
+         )
+       order by candidate.created_at, candidate.step_index
+       for update of candidate skip locked
+       limit 1
  )
 returning *;
 ```
@@ -68,52 +64,46 @@ Two properties matter:
 - `FOR UPDATE SKIP LOCKED` lets N workers claim distinct steps concurrently with no
   coordination. No leader election, no central scheduler.
 - The **lease** is what makes crash recovery work. A crashed worker cannot release
-  anything; its lease simply expires. `LEASE_DURATION` must comfortably exceed
-  `STEP_TIMEOUT`, or a healthy worker's step gets reclaimed while it is still running —
-  which is exactly the duplicate execution the lease exists to prevent. `config.Validate`
-  rejects a configuration where that ordering does not hold.
+  anything; its lease simply expires. An expired `running` row is sent to reconciliation,
+  never claimed as ordinary pending work. `LEASE_DURATION` must comfortably exceed
+  `STEP_TIMEOUT`; `config.Validate` rejects a configuration where that ordering does not
+  hold.
 
 ## `in_doubt` is not `failed`
 
-A step that returns an error has definitely failed; it can be retried or compensated.
+A step that returns a definite error is classified as transient or permanent; only
+transient errors within the retry policy are retried.
 
-A step that times out has an **unknown** outcome. Retrying `CREATE DATABASE foo` because
-the first call timed out is how you get "database already exists" — or worse, a retry loop
-that never converges. So a timeout transitions the step to `in_doubt`, and reconciliation
-inspects the actual world before deciding:
-
-| Observed | Transition |
-| --- | --- |
-| Resource exists and matches intent | `done` — the work landed, the ack was lost |
-| Resource absent | `pending` — safe to retry |
-| Resource exists but differs | `failed` — needs human attention, not a retry |
-
-Reconciliation runs on startup for every `in_doubt` step, so a process that died mid-step
-resolves as soon as any worker comes back.
+A step that times out has an **unknown** outcome. It moves to `in_doubt`, and a
+step-kind-specific reconciler inspects actual state before allowing a retry. An expired
+lease is treated the same way. Reconciliation runs at startup and periodically; the exact
+check and resulting transition for every setup and cleanup kind are specified in
+[`design.md`](design.md).
 
 ## Idempotency
 
-Every step is written so that running it twice is a no-op or converges:
+Work is at least once, never exactly once. Every step must be idempotent or reconcilable:
 
 - **`CREATE DATABASE`** — check `pg_database` first; treat `42P04` (duplicate_database) as
   success rather than failure.
 - **`CREATE ROLE`** — same pattern with `pg_roles` and `42710` (duplicate_object).
 - **Grants** — naturally idempotent, safe to re-run unconditionally.
-- **Credential storage** — write to a deterministic Vault path derived from the
-  environment ID, so a retry overwrites rather than creates a second secret.
+- **Credential storage** — use a deterministic Vault path derived from the environment ID,
+  so a retry converges on one secret. Secret values never appear in the database or
+  observability data.
 
-Duplicate *events* are handled one level up: creation is keyed by a client-supplied
+Duplicate requests are handled one level up: creation is keyed by a client-supplied
 idempotency key with a unique constraint, so a retried `POST /environments` returns the
 existing environment instead of provisioning a second one.
 
-## Compensation
+## Compensation and deletion
 
-When a step fails permanently, the completed steps are compensated in reverse order:
-drop the role, drop the database, delete the Vault path. Compensation is itself a sequence
-of retryable steps, so a crash during rollback resumes rather than leaving debris.
-
-The environment ends in `rolled_back`, which is a terminal success — the system correctly
-returned to a clean state.
+Provisioning rollback, client cancellation, and client deletion are distinct durable
+cleanup workflows. Each cleanup action is a workflow step, retried and reconciled like
+forward work. A crash resumes cleanup from its rows. `rolled_back`, `cancelled`, and
+`deleted` mean their respective cleanup completed; an environment remains `deleting` (or
+reports a visible cleanup failure) until all deletion steps are done. It is never reported
+deleted while cleanup is pending. See the contract for states and terminal conditions.
 
 ## The readiness gate
 
@@ -122,7 +112,8 @@ API returned 200 for each prior step. It opens a **new connection as the provisi
 with the provisioned credential**, and runs a query against the provisioned database.
 
 Only then does the environment become `ready`. An environment that is marked ready has
-been proven usable by the same path a consumer would use.
+been proven usable by the same path a consumer would use. Credentials are retrievable only
+through the separately authorized credentials endpoint, never through status or history.
 
 ## Observability
 
