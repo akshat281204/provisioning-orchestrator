@@ -76,6 +76,12 @@ func (f *fakeStore) GetByIdempotencyKey(_ context.Context, tenantID, idemKey str
 func (f *fakeStore) Get(_ context.Context, id string) (domain.Environment, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	// The database answers a non-UUID environment_id with SQLSTATE 22P02
+	// (invalid text representation), which is NOT an ErrNotFound. Mimic it so
+	// a test only passes when the handler rejects malformed ids itself.
+	if !uuidPattern.MatchString(strings.ToLower(id)) {
+		return domain.Environment{}, fmt.Errorf("fake: get %s: %w", id, pathIDNotUUID)
+	}
 	env, ok := f.envs[id]
 	if !ok {
 		return domain.Environment{}, fmt.Errorf("fake: get %s: %w", id, store.ErrNotFound)
@@ -238,12 +244,47 @@ func TestGetUnknownEnvironmentReturns404WithJSONError(t *testing.T) {
 	}
 }
 
+// validMissingUUID is a syntactically valid UUID that the store has never
+// seen. It is the realistic miss: the handler validates it and forwards it,
+// and the (real or fake) store answers ErrNotFound — which must map to 404,
+// not 500.
+const validMissingUUID = "00000000-0000-4000-8000-000000000abc"
+
+// TestValidButUnknownUUIDReturns404OnBothReadEndpoints covers the acceptance
+// criterion through the actual ErrNotFound mapping in writeEnvironmentOrError:
+// a well-formed UUID absent from the store answers 404 with the JSON error
+// envelope on both GET /environments/{id} and GET /environments/{id}/history.
+func TestValidButUnknownUUIDReturns404OnBothReadEndpoints(t *testing.T) {
+	a := New(newFakeStore())
+
+	for _, path := range []string{
+		"/environments/" + validMissingUUID,
+		"/environments/" + validMissingUUID + "/history",
+	} {
+		rec := httptest.NewRecorder()
+		a.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+		if rec.Code != http.StatusNotFound {
+			t.Errorf("GET %s: expected 404, got %d: %s", path, rec.Code, rec.Body.String())
+			continue
+		}
+		var e errorResponse
+		if err := json.Unmarshal(rec.Body.Bytes(), &e); err != nil {
+			t.Errorf("GET %s: body must be the JSON error envelope, got %s", path, rec.Body.String())
+			continue
+		}
+		if e.Error.Code != "not_found" || e.Error.Message == "" {
+			t.Errorf("GET %s: want not_found code and message, got %+v", path, e.Error)
+		}
+	}
+}
+
 func TestHistoryReturnsRedactedTimelineOnly(t *testing.T) {
 	fs := newFakeStore()
 	a := New(fs)
 
 	env := domain.Environment{
-		ID: "env-h", TenantID: "t1", Name: "n", State: domain.EnvProvisioning,
+		ID: "11111111-2222-4333-8444-555555555555", TenantID: "t1", Name: "n",
+		State:          domain.EnvProvisioning,
 		IdempotencyKey: "k", Spec: []byte(`{}`),
 		// metadata contains no whitelisted connection key and a secret-shaped
 		// one; neither may reach the response.
@@ -312,7 +353,8 @@ func TestGetEnvironmentExposesConnectionFieldsButNeverMetadata(t *testing.T) {
 	a := New(fs)
 
 	env := domain.Environment{
-		ID: "env-m", TenantID: "t1", Name: "n", State: domain.EnvReady,
+		ID: "66666666-7777-4888-9999-000000000000", TenantID: "t1", Name: "n",
+		State:          domain.EnvReady,
 		IdempotencyKey: "k", Spec: []byte(`{}`),
 		// ready environment metadata as the provisioning workflow would write
 		// it, with a password-shaped extra key that must never surface.
@@ -342,7 +384,8 @@ func TestGetEnvironmentWithNoConnectionFieldsOmitsThem(t *testing.T) {
 	fs := newFakeStore()
 	a := New(fs)
 	env := domain.Environment{
-		ID: "env-p", TenantID: "t1", Name: "n", State: domain.EnvPending,
+		ID: "aaaaaabb-cccc-4ddd-8eee-ffff00000011", TenantID: "t1", Name: "n",
+		State:          domain.EnvPending,
 		IdempotencyKey: "k", Spec: []byte(`{}`), Metadata: []byte(`{}`),
 	}
 	if _, err := fs.CreateEnvironmentWithPlan(context.Background(), env, domain.Plan()); err != nil {
@@ -359,12 +402,87 @@ func TestGetEnvironmentWithNoConnectionFieldsOmitsThem(t *testing.T) {
 	}
 }
 
-func TestHistoryOfUnknownEnvironmentIs404(t *testing.T) {
+// TestMalformedPathIDReturns404Not500 covers the real-database failure mode:
+// a non-UUID id sent into the uuid column raises SQLSTATE 22P02, which is not
+// ErrNotFound. The fake store mimics that error, so these tests fail with a
+// 500 if a handler ever forwards a malformed path id to the store.
+func TestMalformedPathIDReturns404Not500(t *testing.T) {
 	a := New(newFakeStore())
-	rec := httptest.NewRecorder()
-	a.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/environments/ghost/history", nil))
-	if rec.Code != http.StatusNotFound {
-		t.Fatalf("expected 404, got %d: %s", rec.Code, rec.Body.String())
+
+	for _, path := range []string{
+		"/environments/nope",
+		"/environments/ghost/history",
+		"/environments/not-a-uuid-at-all",
+		"/environments/11111111-2222-4333-8444-5555555555zz",
+	} {
+		rec := httptest.NewRecorder()
+		a.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+		if rec.Code != http.StatusNotFound {
+			t.Errorf("GET %s: expected 404, got %d: %s", path, rec.Code, rec.Body.String())
+			continue
+		}
+		var e errorResponse
+		if err := json.Unmarshal(rec.Body.Bytes(), &e); err != nil ||
+			e.Error.Code != "not_found" || e.Error.Message == "" {
+			t.Errorf("GET %s: body must be the not_found error envelope, got %s", path, rec.Body.String())
+		}
+	}
+}
+
+// TestReplayIgnoresJSONBKeyOrder is the production-shape regression test for
+// the fingerprint: Postgres jsonb does not preserve object key order (keys
+// come back sorted by length, then bytewise), so the stored spec of this
+// multi-key spec differs byte-wise from the request that created it. A
+// replay of that same request must still answer 200, never 409.
+func TestReplayIgnoresJSONBKeyOrder(t *testing.T) {
+	fs := newFakeStore()
+	a := New(fs)
+
+	body := `{"tenantId":"t1","name":"orders-db","spec":{"region":"us-east-1","size":"small","replicas":2}}`
+	first := postCreate(t, a, body, "key-jsonb")
+	if first.Code != http.StatusAccepted {
+		t.Fatalf("expected 202, got %d: %s", first.Code, first.Body.String())
+	}
+
+	// Rewrite the stored spec the way jsonb would normalise it: keys sorted
+	// by length ("size"(4) "region"(6) "replicas"(8)), whitespace removed.
+	var resp environmentResponse
+	if err := json.Unmarshal(first.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	fs.mu.Lock()
+	env := fs.envs[resp.EnvironmentID]
+	env.Spec = []byte(`{"size":"small","region":"us-east-1","replicas":2}`)
+	fs.envs[resp.EnvironmentID] = env
+	fs.mu.Unlock()
+
+	second := postCreate(t, a, body, "key-jsonb")
+	if second.Code != http.StatusOK {
+		t.Fatalf("replay of the same request must be 200 despite jsonb key reordering, got %d: %s",
+			second.Code, second.Body.String())
+	}
+	var replayed environmentResponse
+	_ = json.Unmarshal(second.Body.Bytes(), &replayed)
+	if replayed.EnvironmentID != resp.EnvironmentID {
+		t.Fatalf("replay returned a different environment: %s vs %s", replayed.EnvironmentID, resp.EnvironmentID)
+	}
+}
+
+// TestReplayNumericAndNestedSpecEquality checks that the fingerprint stays
+// value-based for nested objects and numbers, not just flat key order.
+func TestReplayNumericAndNestedSpecEquality(t *testing.T) {
+	a := New(newFakeStore())
+
+	body := `{"tenantId":"t1","name":"db","spec":{"limits":{"cpu":2,"mem": 4096},"tags":["a","b"]}}`
+	if rec := postCreate(t, a, body, "key-nested"); rec.Code != http.StatusAccepted {
+		t.Fatalf("expected 202, got %d: %s", rec.Code, rec.Body.String())
+	}
+	second := postCreate(t, a, body, "key-nested")
+	if second.Code != http.StatusOK {
+		t.Fatalf("replay of a nested/numeric spec must be 200, got %d: %s", second.Code, second.Body.String())
+	}
+	if rec := postCreate(t, a, `{"tenantId":"t1","name":"db","spec":{"limits":{"cpu":4,"mem":4096},"tags":["a","b"]}}`, "key-nested"); rec.Code != http.StatusConflict {
+		t.Fatalf("a genuinely different nested value must be 409, got %d: %s", rec.Code, rec.Body.String())
 	}
 }
 
@@ -373,6 +491,16 @@ func TestRedactTextPatterns(t *testing.T) {
 		`password=hunter2 failed`:                       "password=[REDACTED] failed",
 		`connect postgres://orch:hunter2@db:5432/app`:   "connect postgres://orch:[REDACTED]@db:5432/app",
 		`auth via Bearer eyJhbGciOiJIUzI1NiJ9 rejected`: "auth via Bearer [REDACTED] rejected",
+		// Compound credential keys the key/value rule must not miss.
+		`access_token=abc123`: `access_token=[REDACTED]`,
+		`client_secret=shh`:   `client_secret=[REDACTED]`,
+		`db_password=foo`:     `db_password=[REDACTED]`,
+		// JSON- and quote-shaped leaks: keys wrapped in quotes, values as
+		// quoted strings (including how a Vault body carries them).
+		`{"password":"hunter2"}`:        `{"password":[REDACTED]}`,
+		`"token":"abc123"`:              `"token":[REDACTED]`,
+		`pagerduty: {"token":"s3cr3t"}`: `pagerduty: {"token":[REDACTED]}`,
+		`apikey: sk-1234`:               `apikey: [REDACTED]`,
 	}
 	for in, want := range cases {
 		if got := redactText(in); got != want {

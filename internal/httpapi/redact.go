@@ -11,9 +11,27 @@ import (
 // former owner of this text may have embedded a connection string, a
 // key=value assignment, or a bearer token.
 
-// keyValSecret matches `password=hunter2`, `token: abc`, `pwd="hunter2"` and
-// friends — the common shapes of credential leakage in driver errors.
-var keyValSecret = regexp.MustCompile(`(?i)\b(password|passwd|pwd|secret|token|api[_-]?key)[\s]*[:=][\s]*("[^"\\]*(?:\\.[^"\\]*)*"|[^\s;,"&)']+)`)
+// keyValSecret matches `password=hunter2`, `token: abc`, `pwd="hunter2"`,
+// `access_token=abc123`, `{"password":"hunter2"}` and friends — the common
+// shapes of credential leakage in driver errors and API error bodies.
+//
+// Three things make it catch more than a bare keyword match:
+//   - `(?:[\w-]*)` before the keyword lets compound names through
+//     (access_token, db_password, client_secret, apikey);
+//   - the two optional quotes around the keyword let JSON-style keys match
+//     (`"password":"hunter2"`), and the replacement keeps them so the
+//     surrounding JSON stays readable; they are matched as independent
+//     optional groups because RE2 has no backreferences;
+//   - the quoted-value alternative spans escaped and empty strings, so a
+//     Vault-style body `{"password":""}` still has its value replaced.
+//
+// The value is always replaced wholesale with the marker, regardless of
+// whether it was quoted; keeping the quotes is not worth per-format
+// replacement rules, and dropping them is safe.
+var keyValSecret = regexp.MustCompile(
+	`(?i)(["']?)((?:[\w-]*)(?:password|passwd|pwd|secret|token|api[_-]?key)[\w-]*)(["']?)` +
+		`([\s]*[:=][\s]*)` +
+		`(?:"(?:\\.|[^"\\])*"|[^\s;,"&)]+)`)
 
 // urlPassword matches the password component of URLs like
 // postgres://user:hunter2@host/db, keeping the username and host visible.
@@ -40,7 +58,7 @@ func redactText(s string) string {
 	if s == "" {
 		return s
 	}
-	out := keyValSecret.ReplaceAllString(s, "$1="+redactedMarker)
+	out := keyValSecret.ReplaceAllString(s, "$1$2$3$4"+redactedMarker)
 	out = urlPassword.ReplaceAllString(out, "$1"+redactedMarker+"$3")
 	out = bearerSecret.ReplaceAllString(out, "$1 "+redactedMarker)
 	if len(out) > maxRedactedText {

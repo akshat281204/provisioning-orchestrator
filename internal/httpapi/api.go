@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"reflect"
+	"regexp"
 	"strings"
 
 	"github.com/akshat281204/provisioning-orchestrator/internal/domain"
@@ -138,18 +140,29 @@ func (a *API) createEnvironment(w http.ResponseWriter, r *http.Request) {
 // replay answers an idempotent re-request. Same request fingerprint: 200 with
 // the existing environment. Different body: 409, per the design contract.
 func (a *API) replay(w http.ResponseWriter, existing domain.Environment, req createRequest, spec []byte) {
-	if existing.Name != req.Name || compactJSONBytes(existing.Spec) != string(spec) {
+	if existing.Name != req.Name || !equalJSONValues(spec, existing.Spec) {
 		writeError(w, http.StatusConflict, "idempotency_key_conflict",
 			"the Idempotency-Key was already used with a different request body")
 		return
 	}
-	writeEnv(w, http.StatusOK, existing, false)
+	writeEnv(w, http.StatusOK, existing, true)
 }
 
 // getEnvironment handles GET /v1/environments/{id}: status and non-secret
 // connection metadata, never credential material.
 func (a *API) getEnvironment(w http.ResponseWriter, r *http.Request) {
-	env, err := a.envs.Get(r.Context(), r.PathValue("id"))
+	envID, ok := environmentIDFromPath(w, r)
+	if !ok {
+		return
+	}
+	env, err := a.envs.Get(r.Context(), envID)
+	writeEnvironmentOrError(w, env, err)
+}
+
+// writeEnvironmentOrError maps a store lookup result onto the response. It is
+// shared by both read endpoints so "not found" always becomes a 404 JSON
+// error, never a raw 500.
+func writeEnvironmentOrError(w http.ResponseWriter, env domain.Environment, err error) {
 	if errors.Is(err, store.ErrNotFound) {
 		writeError(w, http.StatusNotFound, "not_found",
 			"no such environment")
@@ -163,20 +176,24 @@ func (a *API) getEnvironment(w http.ResponseWriter, r *http.Request) {
 	writeEnv(w, http.StatusOK, env, false)
 }
 
+// pathIDNotUUID is returned by the fake store when it receives an id the
+// database would reject; it deliberately does not wrap ErrNotFound so tests
+// catch a handler that forwards malformed path ids to the store instead of
+// rejecting them first (Postgres answers such a query with SQLSTATE 22P02,
+// which is not a not-found condition).
+var pathIDNotUUID = errors.New("fake: path id is not a uuid")
+
 // getHistory handles GET /v1/environments/{id}/history: the redacted step
 // timeline. It maps domain.Step through stepView, which has no metadata
 // field, and scrubs last_error, so no raw step state can reach the wire.
 func (a *API) getHistory(w http.ResponseWriter, r *http.Request) {
-	envID := r.PathValue("id")
-	env, err := a.envs.Get(r.Context(), envID)
-	if errors.Is(err, store.ErrNotFound) {
-		writeError(w, http.StatusNotFound, "not_found",
-			"no such environment")
+	envID, ok := environmentIDFromPath(w, r)
+	if !ok {
 		return
 	}
+	env, err := a.envs.Get(r.Context(), envID)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "internal_error",
-			"reading the environment failed")
+		writeEnvironmentOrError(w, domain.Environment{}, err)
 		return
 	}
 	steps, err := a.envs.ListForEnvironment(r.Context(), envID)
@@ -205,6 +222,25 @@ func (a *API) getHistory(w http.ResponseWriter, r *http.Request) {
 		resp.Steps = append(resp.Steps, view)
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// uuidPattern accepts the canonical 8-4-4-4-12 hexadecimal form that both
+// newEnvironmentID produces and the environment_id uuid column accepts.
+var uuidPattern = regexp.MustCompile(
+	`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
+
+// environmentIDFromPath validates the {id} path segment as a UUID. Path
+// ids are UUIDs by design; anything else is a miss, not a server error —
+// forwarding a non-UUID into the uuid column makes Postgres raise SQLSTATE
+// 22P02, which would surface to the client as a 500. It returns false and
+// has already written the response when it fails.
+func environmentIDFromPath(w http.ResponseWriter, r *http.Request) (string, bool) {
+	id := r.PathValue("id")
+	if !uuidPattern.MatchString(strings.ToLower(id)) {
+		writeError(w, http.StatusNotFound, "not_found", "no such environment")
+		return "", false
+	}
+	return id, true
 }
 
 // writeEnv renders an environment as its wire shape, deriving the redacted
@@ -266,16 +302,22 @@ func compactJSON(raw []byte) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-// compactJSONBytes compacts already-stored JSON for fingerprint comparison;
-// on the (impossible under the constraint) path where stored spec is not
-// valid JSON it falls through to the raw bytes so the comparison stays
-// conservative rather than claiming "same".
-func compactJSONBytes(raw []byte) string {
-	c, err := compactJSON(raw)
-	if err != nil {
-		return string(raw)
+// equalJSONValues compares two JSON documents by value, so an idempotency
+// fingerprint cannot depend on representation. This matters because Postgres
+// jsonb does not preserve object key order (it sorts keys by length, then
+// bytewise), so the stored spec can differ byte-wise from the request that
+// produced it while holding the same value. Both sides are decoded into
+// generic Go values and compared; messages with numbers are compared as
+// decoded float64 values, which is exact for the magnitudes a spec carries.
+// On the (impossible under the write path, which validates first) path where
+// a document is not valid JSON the comparison falls back to byte equality so
+// it stays conservative rather than claiming "same".
+func equalJSONValues(a, b []byte) bool {
+	var va, vb any
+	if json.Unmarshal(a, &va) != nil || json.Unmarshal(b, &vb) != nil {
+		return string(a) == string(b)
 	}
-	return string(c)
+	return reflect.DeepEqual(va, vb)
 }
 
 // newEnvironmentID generates a random UUIDv4 for the environment row.
