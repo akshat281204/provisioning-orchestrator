@@ -1,43 +1,46 @@
 ---
 phase: 3
 slug: http-api
-title: HTTP API and idempotent environment creation
-touches: internal/httpapi/, internal/app/, cmd/orchestrator/
+title: /v1 API with atomic, idempotent creation
+touches: internal/httpapi/, internal/app/, internal/domain/
 verify: make verify
 ---
 
 ## Goal
 
-A client can create an environment and read its status over HTTP. Creating twice with the
-same `Idempotency-Key` returns the same environment instead of provisioning a second one.
+A client can create an environment and watch it, over the `/v1` surface the design contract
+defines. Creation is atomic: an environment can never exist without its initial workflow
+state. Repeating a request with the same key returns the same environment.
 
 ## Changes
 
-- `internal/httpapi/api.go`: a `Handler(stores)` constructor returning `http.Handler`,
-  mounted by `internal/app` alongside the existing health endpoints.
-- `POST /environments`:
-  - Body `{"name": "..."}`; `Idempotency-Key` header required, `400` if missing or empty.
-  - Creates the environment as `pending` and inserts its steps from `domain.Plan()` in a
-    **single transaction** — an environment without steps is a corrupt row.
-  - `201` with the created environment; on a duplicate idempotency key, `200` with the
-    existing environment and no new rows.
-- `GET /environments/{id}`: `200` with the environment and its steps, `404` on
-  `store.ErrNotFound`.
-- `GET /environments`: list, newest first, with a `limit` query param (default 50, max
-  200).
-- JSON shapes live in `internal/httpapi/dto.go` so domain types stay transport-agnostic.
-- Handler tests using an in-memory fake implementing the store interfaces. No database.
+- `internal/httpapi/api.go`, mounted by `internal/app` under `/v1`.
+- `POST /v1/environments`:
+  - Body `{"tenantId": "...", "name": "...", "spec": {...}}`.
+  - `Idempotency-Key` header required — `400` and no writes when missing or empty.
+  - Inserts the environment and all `domain.Plan()` steps in **one transaction**.
+  - `202 Accepted` with `{"environmentId", "status", "statusUrl"}`.
+  - Duplicate key: `200` with the existing environment, no new rows.
+- `GET /v1/environments/{id}`: `200` with status and **non-secret** connection metadata
+  (`host`, `database`, `credentialRef` — never the secret itself). `404` on `ErrNotFound`.
+- `GET /v1/environments/{id}/history`: redacted step timeline derived from `workflow_steps`
+  (index, kind, state, attempts, timestamps, last_error). No secret material.
+- `internal/httpapi/dto.go` for wire shapes so domain types stay transport-agnostic.
+- Handler tests against an in-memory fake implementing the store interfaces. No database.
+- Central error mapper producing `{"error": {"code", "message"}}`; `last_error` and
+  internal errors must be scrubbed before they reach a response.
 
 ## Acceptance
 
 - [ ] `make verify` passes with no database running.
-- [ ] Two `POST`s with the same `Idempotency-Key` produce exactly one environment and
-      one set of steps, and the second response is `200`, not `201`.
-- [ ] A `POST` without the header returns `400` and creates nothing.
-- [ ] A created environment has exactly the steps `domain.Plan()` specifies, in order.
-- [ ] `GET` of an unknown id returns `404` with a JSON body, not a bare status.
-- [ ] `limit` above 200 is clamped, not rejected.
+- [ ] Two `POST`s with one `Idempotency-Key` create exactly one environment and one step
+      plan; the second returns `200`, not `202`.
+- [ ] Ten concurrent `POST`s with one key create exactly one environment.
+- [ ] A `POST` with no `Idempotency-Key` returns `400` and writes nothing.
+- [ ] No response body, at any status, contains a password, token, or Vault secret value.
+- [ ] `GET` of an unknown id returns `404` with a JSON error body.
+- [ ] The history endpoint never returns `metadata` verbatim — only the redacted fields.
 
 ## Out of scope
 
-- Auth, pagination cursors, PATCH, deletion.
+- `cancel`, `delete`, `rotate` — they need durable cleanup and land in phases 6 and 7.
