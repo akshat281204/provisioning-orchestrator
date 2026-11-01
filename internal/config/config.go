@@ -28,19 +28,27 @@ type Config struct {
 	// LeaseDuration is how long a worker owns a step before another worker may
 	// reclaim it. Must be comfortably larger than StepTimeout.
 	LeaseDuration time.Duration
+	// DependencyCheckTimeout bounds a single readiness probe of a dependency,
+	// so one hung dependency cannot stall /readyz.
+	DependencyCheckTimeout time.Duration
+	// ShutdownTimeout bounds graceful shutdown: draining in-flight requests
+	// and closing dependencies.
+	ShutdownTimeout time.Duration
 }
 
 // Load reads configuration from the environment, applying defaults.
 func Load() (Config, error) {
 	c := Config{
-		HTTPAddr:          env("HTTP_ADDR", ":8080"),
-		DatabaseURL:       env("DATABASE_URL", "postgres://orchestrator:orchestrator@localhost:5432/orchestrator?sslmode=disable"),
-		VaultAddr:         env("VAULT_ADDR", "http://localhost:8200"),
-		VaultToken:        env("VAULT_TOKEN", "root"),
-		OTLPEndpoint:      env("OTEL_EXPORTER_OTLP_ENDPOINT", "localhost:4317"),
-		WorkerConcurrency: 4,
-		StepTimeout:       30 * time.Second,
-		LeaseDuration:     90 * time.Second,
+		HTTPAddr:               env("HTTP_ADDR", ":8080"),
+		DatabaseURL:            env("DATABASE_URL", "postgres://orchestrator:orchestrator@localhost:5432/orchestrator?sslmode=disable"),
+		VaultAddr:              env("VAULT_ADDR", "http://localhost:8200"),
+		VaultToken:             env("VAULT_TOKEN", "root"),
+		OTLPEndpoint:           env("OTEL_EXPORTER_OTLP_ENDPOINT", "localhost:4317"),
+		WorkerConcurrency:      4,
+		StepTimeout:            30 * time.Second,
+		LeaseDuration:          90 * time.Second,
+		DependencyCheckTimeout: 2 * time.Second,
+		ShutdownTimeout:        15 * time.Second,
 	}
 
 	var err error
@@ -51,6 +59,12 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	if c.LeaseDuration, err = envDuration("LEASE_DURATION", c.LeaseDuration); err != nil {
+		return Config{}, err
+	}
+	if c.DependencyCheckTimeout, err = envDuration("DEPENDENCY_CHECK_TIMEOUT", c.DependencyCheckTimeout); err != nil {
+		return Config{}, err
+	}
+	if c.ShutdownTimeout, err = envDuration("SHUTDOWN_TIMEOUT", c.ShutdownTimeout); err != nil {
 		return Config{}, err
 	}
 
@@ -78,6 +92,12 @@ func (c Config) Validate() error {
 			"config: lease duration (%s) must exceed step timeout (%s) or steps will be reclaimed while still running",
 			c.LeaseDuration, c.StepTimeout,
 		)
+	}
+	if c.DependencyCheckTimeout <= 0 {
+		return fmt.Errorf("config: dependency check timeout must be positive, got %s", c.DependencyCheckTimeout)
+	}
+	if c.ShutdownTimeout <= 0 {
+		return fmt.Errorf("config: shutdown timeout must be positive, got %s", c.ShutdownTimeout)
 	}
 	return nil
 }
