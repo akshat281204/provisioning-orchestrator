@@ -4,7 +4,7 @@
   "planDir": "plan",
   "reviewDir": ".review",
   "models": {
-    "builder": "opencode-go/glm-5.3#low",
+    "builder": "opencode-go/glm-5.3-flash#low",
     "reviewer": "opencode-go/deepseek-v4-pro"
   },
   "agents": {
