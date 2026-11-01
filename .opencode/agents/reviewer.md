@@ -1,7 +1,7 @@
 ---
 description: Reviews one phase's diff. Read-only on source — may only write its verdict into .review/.
 mode: primary
-model: opencode-go/deepseek-v4-pro
+model: opencode-go/deepseek-v4.1-flash#low
 permissions:
   - action: "*"
     resource: "*"

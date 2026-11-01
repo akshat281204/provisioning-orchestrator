@@ -5,7 +5,7 @@
   "reviewDir": ".review",
   "models": {
     "builder": "opencode-go/glm-5.3-flash#low",
-    "reviewer": "opencode-go/deepseek-v4-pro"
+    "reviewer": "opencode-go/deepseek-v4.1-flash#low"
   },
   "agents": {
     "builder": "builder",
