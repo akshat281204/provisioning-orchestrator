@@ -61,7 +61,8 @@ func migrate(t *testing.T, pool *pgxpool.Pool) {
 // skewed by rows left behind by earlier (possibly failed) test runs.
 func truncate(t *testing.T, pool *pgxpool.Pool) {
 	t.Helper()
-	if _, err := pool.Exec(context.Background(), `TRUNCATE workflow_steps, environments`); err != nil {
+	if _, err := pool.Exec(context.Background(),
+		`TRUNCATE capacity_reservations, workflow_steps, environments`); err != nil {
 		t.Fatalf("truncate tables: %v", err)
 	}
 }
@@ -320,7 +321,14 @@ WHERE schemaname = 'public'`)
 	}
 	defer rows.Close()
 	// schema_migrations belongs to the migration tool, not the domain.
-	allowed := map[string]bool{"environments": true, "workflow_steps": true, "schema_migrations": true}
+	// capacity_reservations is phase 5's durable reservation ledger for the
+	// Capacity adapter — committed state, not a derived projection.
+	allowed := map[string]bool{
+		"environments":          true,
+		"workflow_steps":        true,
+		"capacity_reservations": true,
+		"schema_migrations":     true,
+	}
 	for rows.Next() {
 		var name string
 		if err := rows.Scan(&name); err != nil {
