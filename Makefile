@@ -29,6 +29,14 @@ test-integration: ## Run tests that need docker-compose up
 vet: ## go vet
 	$(GO) vet ./...
 
+GOLINT_BIN := $(shell $(GO) env GOPATH)/bin/golangci-lint
+GOLINT_VERSION := v1.64.8
+
+.PHONY: lint
+lint: ## golangci-lint using the repo's .golangci.yml
+	@test -x "$(GOLINT_BIN)" || GOBIN="$(dir $(GOLINT_BIN))" $(GO) install github.com/golangci/golangci-lint/cmd/golangci-lint@$(GOLINT_VERSION)
+	"$(GOLINT_BIN)" run
+
 .PHONY: fmt
 fmt: ## Format all Go source
 	$(GO) fmt ./...
@@ -38,7 +46,7 @@ fmt-check: ## Fail if any file is not gofmt'd
 	@out="$$(gofmt -l .)"; if [ -n "$$out" ]; then echo "not gofmt'd:"; echo "$$out"; exit 1; fi
 
 .PHONY: verify
-verify: fmt-check vet test build ## The gate the agent loop runs after every phase
+verify: fmt-check vet lint test build ## The gate the agent loop runs after every phase
 
 .PHONY: up
 up: ## Start postgres, vault, otel-collector, prometheus
