@@ -16,6 +16,7 @@ import (
 func main() {
 	log := slog.New(telemetry.NewRedactingHandler(
 		slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo})))
+	slog.SetDefault(log)
 
 	cfg, err := config.Load()
 	if err != nil {

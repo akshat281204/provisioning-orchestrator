@@ -23,7 +23,7 @@ test: ## Run unit tests (no external services required)
 
 .PHONY: test-integration
 test-integration: ## Run tests that need docker-compose up
-	$(GO) test -race -count=1 -tags=integration ./...
+	$(GO) test -p 1 -race -count=1 -tags=integration ./...
 
 .PHONY: vet
 vet: ## go vet

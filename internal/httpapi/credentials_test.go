@@ -481,20 +481,31 @@ func TestRotationFlow(t *testing.T) {
 	}
 }
 
-func TestRotationFailureMarksTheEnvironmentFailed(t *testing.T) {
+func TestRotationFailureRemainsRetryable(t *testing.T) {
 	rig := newCredRig(t)
 	rig.setVerifier(&fakeVerifier{err: fmt.Errorf("verify: %w", adapters.ErrVerificationAuth)})
 	rec := rig.post("/environments/"+envReadyID+"/rotate", allowedCaller)
-	if rec.Code != http.StatusInternalServerError {
-		t.Fatalf("failed rotation: %d, want 500", rec.Code)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("failed rotation: %d, want retryable 503", rec.Code)
 	}
-	if rig.store.envs[envReadyID].State != domain.EnvFailed {
-		t.Errorf("environment after failed rotation: %q", rig.store.envs[envReadyID].State)
+	if rig.store.envs[envReadyID].State != domain.EnvRotating {
+		t.Errorf("environment after failed rotation: %q, want rotating", rig.store.envs[envReadyID].State)
+	}
+	if got := rig.secrets.payload[envReadyID][payloadKeyPassword]; got != sentinelPassword {
+		t.Errorf("unverified candidate replaced the active secret: got %q, want original", got)
+	}
+	if got := rig.roles.passwords["role-"+envReadyID]; got == sentinelPassword {
+		t.Error("test did not exercise a role change before the verification failure")
 	}
 	if strings.Contains(rec.Body.String(), sentinelPassword) {
 		t.Error("the failed rotation leaked the secret")
 	}
 	if !strings.Contains(rig.auditLog.String(), "rotate_credentials") {
 		t.Error("the failed rotation was not audited")
+	}
+	rig.setVerifier(&connectingVerifier{roles: rig.roles})
+	retry := rig.post("/environments/"+envReadyID+"/rotate", allowedCaller)
+	if retry.Code != http.StatusOK || rig.stateOf(envReadyID) != domain.EnvReady {
+		t.Fatalf("retry did not converge: status=%d state=%q body=%s", retry.Code, rig.stateOf(envReadyID), retry.Body.String())
 	}
 }

@@ -44,6 +44,8 @@ type rigFixture struct {
 	st       *store.PostgresStore
 	pool     *pgxpool.Pool
 	vaultSec *adapters.VaultSecrets
+	roles    *adapters.LocalRoles
+	log      *slog.Logger
 	logs     *bytes.Buffer
 }
 
@@ -94,31 +96,42 @@ func newRig(t *testing.T) *rigFixture {
 	vaultSec.Log = log
 	roles := adapters.NewLocalRoles(pool, dbURL, log)
 
-	// The worker runs only for the duration of the test rig.
-	wctx, wcancel := context.WithCancel(context.Background())
-	t.Cleanup(wcancel)
-	workers := &worker.Pool{
-		Concurrency:   1,
-		LeaseDuration: 10 * time.Second,
-		StepTimeout:   5 * time.Second,
-		Store:         st,
-		Executor: &worker.AdapterExecutor{
-			Capacity:  adapters.NewLocalCapacity(pool, log),
-			Databases: adapters.NewLocalDatabases(pool, dbURL, log),
-			Roles:     roles,
-			Secrets:   vaultSec,
-			Verifier:  adapters.NewLocalVerifier(dbURL),
-			Envs:      st,
-		},
-		Log: log,
-	}
-	go func() { _ = workers.Run(wctx) }()
-
 	api := httpapi.New(st)
 	api.AttachCredentials(vaultSec, roles, adapters.NewLocalVerifier(dbURL),
 		httpapi.NewCredentialPolicy(e2eCaller), log)
 
-	return &rigFixture{api: api, st: st, pool: pool, vaultSec: vaultSec, logs: logs}
+	return &rigFixture{api: api, st: st, pool: pool, vaultSec: vaultSec, roles: roles, log: log, logs: logs}
+}
+
+// startWorker starts after the test environment is inserted, so this isolated
+// test worker cannot race unrelated pending rows in the shared integration DB.
+func (r *rigFixture) startWorker(t *testing.T) {
+	t.Helper()
+	wctx, wcancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	workers := &worker.Pool{
+		Concurrency:   1,
+		LeaseDuration: 10 * time.Second,
+		StepTimeout:   5 * time.Second,
+		Store:         r.st,
+		Executor: &worker.AdapterExecutor{
+			Capacity:  adapters.NewLocalCapacity(r.pool, r.log),
+			Databases: adapters.NewLocalDatabases(r.pool, dbURL, r.log),
+			Roles:     r.roles,
+			Secrets:   r.vaultSec,
+			Verifier:  adapters.NewLocalVerifier(dbURL),
+			Envs:      r.st,
+		},
+		Log: r.log,
+	}
+	go func() {
+		defer close(done)
+		_ = workers.Run(wctx)
+	}()
+	t.Cleanup(func() {
+		wcancel()
+		<-done
+	})
 }
 
 // call issues a request against the API's handler and returns the decoded
@@ -215,6 +228,7 @@ func TestProvisionEndToEndConnectsExternally(t *testing.T) {
 		t.Fatalf("missing environmentId: %v", created)
 	}
 	t.Cleanup(func() { dropEnvResources(t, rig.pool, rig.vaultSec, envID) })
+	rig.startWorker(t)
 
 	waitFor(t, func() bool {
 		_, st := rig.call(t, http.MethodGet, "/environments/"+envID, "", "")

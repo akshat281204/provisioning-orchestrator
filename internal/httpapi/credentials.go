@@ -142,12 +142,9 @@ func (a *API) retrieveCredentials(w http.ResponseWriter, r *http.Request) {
 }
 
 // rotateEnvironment handles POST /v1/environments/{id}/rotate: a new
-// password is written to the secrets adapter BEFORE it is applied to the
-// role, so a crash mid-rotation leaves the secrets adapter holding a fresh
-// intent and an execution of this endpoint again converges. The attempt is
-// resumable: a retry after a timeout (or a concurrent retry) applies a fresh
-// password, verifies it, and restores the environment — never reporting
-// success for an unchanged credential.
+// password is applied to the role, verified, and then written to the secrets
+// adapter. The environment remains rotating on failures so a retry can
+// converge without making an unverified credential retrievable.
 //
 // The whole attempt runs under the per-environment rotation lock, so
 // overlapping requests (e.g. a client timeout plus its retry) can never each
@@ -180,7 +177,9 @@ func (a *API) rotateEnvironment(w http.ResponseWriter, r *http.Request) {
 				"another rotation is already in progress for this environment")
 			return
 		}
-		a.rotateFailure(w, r, caller, envID, "acquiring the rotation lock failed")
+		a.audit(caller, envID, false, "rotate_credentials", "acquiring the rotation lock failed")
+		writeError(w, http.StatusServiceUnavailable, "rotation_unavailable",
+			"the rotation lock could not be acquired; retry the request")
 		return
 	}
 	defer func() {
@@ -188,7 +187,9 @@ func (a *API) rotateEnvironment(w http.ResponseWriter, r *http.Request) {
 		// permanent leak, but it must not pass silently.
 		if rerr := release(); rerr != nil {
 			a.audit(caller, envID, false, "rotate_credentials", "releasing the rotation lock failed")
-			slog.Error("rotation lock release failed", "error", rerr)
+			if a.auditLog != nil {
+				a.auditLog.Error("rotation lock release failed", "error", rerr)
+			}
 		}
 	}()
 
@@ -211,14 +212,9 @@ func (a *API) rotationUnderLock(
 		return
 	}
 
-	payload, err := a.secrets.Get(ctx, envID)
-	if err != nil {
-		a.rotateFailure(w, r, caller, envID, "secret read failed")
-		return
-	}
-
 	// Only a ready environment starts a rotation; a rotating one is a retry
-	// (resume) of an in-flight rotation, and any other state refuses the
+	// (resume) of an in-flight rotation. Record that durable intent before
+	// external I/O so every failure is resumable. Any other state refuses the
 	// request — rotating while provisioning would orphan the verification
 	// that made the environment usable in the first place.
 	switch env.State {
@@ -243,20 +239,18 @@ func (a *API) rotationUnderLock(
 		return
 	}
 
+	payload, err := a.secrets.Get(ctx, envID)
+	if err != nil {
+		a.rotateFailure(w, r, caller, envID, "secret read failed")
+		return
+	}
+
 	newPassword, err := adapters.NewPassword()
 	if err != nil {
 		a.rotateFailure(w, r, caller, envID, "password generation failed")
 		return
 	}
 	payload[payloadKeyPassword] = newPassword
-	// Intent is durable first: the secrets adapter holds the new password
-	// before the role does, so an interrupted attempt converges — the next
-	// call resumes, writes a fresh intent, applies it, and verifies.
-	if err := a.secrets.Put(ctx, envID, payload); err != nil {
-		a.rotateFailure(w, r, caller, envID, "storing the new credential failed")
-		return
-	}
-
 	if payload[payloadKeyDatabase] == "" || payload[payloadKeyUsername] == "" || newPassword == "" {
 		a.rotateFailure(w, r, caller, envID, "stored credential document is incomplete")
 		return
@@ -271,6 +265,13 @@ func (a *API) rotationUnderLock(
 	if err := verifyWithShortRetry(ctx, a.verifier,
 		payload[payloadKeyDatabase], payload[payloadKeyUsername], newPassword); err != nil {
 		a.rotateFailure(w, r, caller, envID, "verifying the rotated credential failed")
+		return
+	}
+	// Publish the new credential only after the role accepts it and a fresh
+	// connection proves it works. If this write fails, state remains rotating;
+	// the next request applies and verifies another candidate before publishing.
+	if err := a.secrets.Put(ctx, envID, payload); err != nil {
+		a.rotateFailure(w, r, caller, envID, "storing the new credential failed")
 		return
 	}
 
@@ -367,20 +368,15 @@ type rotationRecord struct {
 	By string `json:"by"`
 }
 
-// rotateFailure records the rotating -> failed edge and its audit entry,
-// then answers with a scrubbed 500. The password is never part of any
-// message.
+// rotateFailure records a retryable error without leaving the durable
+// rotating state. A partial external operation must never make the rotation
+// unrecoverable; callers can safely retry while the environment is rotating.
 func (a *API) rotateFailure(
 	w http.ResponseWriter, r *http.Request, caller, envID, reason string,
 ) {
-	ctx := r.Context()
-	if err := a.envs.TransitionEnvironment(ctx, envID, domain.EnvFailed); err != nil {
-		a.audit(caller, envID, false, "rotate_credentials", reason+" (and the state move failed)")
-	} else {
-		a.audit(caller, envID, false, "rotate_credentials", reason)
-	}
-	writeError(w, http.StatusInternalServerError, "rotation_failed",
-		"the rotation failed; the environment is marked failed and the credential must be recovered manually")
+	a.audit(caller, envID, false, "rotate_credentials", reason)
+	writeError(w, http.StatusServiceUnavailable, "rotation_retryable",
+		"the rotation did not complete; the environment remains rotating and the request can be retried")
 }
 
 // verifyWithShortRetry runs the verifier a few times over transient errors.
