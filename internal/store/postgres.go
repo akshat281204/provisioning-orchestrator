@@ -153,6 +153,149 @@ func (s *PostgresStore) GetByIdempotencyKey(ctx context.Context, tenantID, idemp
 	return env, nil
 }
 
+// stepColumns is the column list shared by every step select query, in
+// scanStepInto order.
+const stepColumns = `id, environment_id, step_index, kind, state, attempts,
+       COALESCE(lease_owner, ''), lease_expires_at,
+       COALESCE(operation_key, ''), metadata, COALESCE(last_error, ''),
+       created_at, updated_at`
+
+// scanStepInto scans one workflow_steps row into a domain.Step.
+func scanStepInto(row pgx.Row) (domain.Step, error) {
+	var (
+		st       domain.Step
+		idx      int
+		kind     string
+		state    string
+		attempts int
+		leaseExp *time.Time
+		leaseExs string
+		asset    []byte
+		crAt     time.Time
+		upAt     time.Time
+	)
+	if err := row.Scan(&st.ID, &st.EnvironmentID, &idx, &kind, &state, &attempts,
+		&st.LeaseOwner, &leaseExp, &st.OperationKey, &asset,
+		&st.LastError, &crAt, &upAt); err != nil {
+		return domain.Step{}, err
+	}
+	st.StepIndex = idx
+	st.Kind = domain.StepKind(kind)
+	st.State = domain.StepState(state)
+	st.Attempts = attempts
+	if leaseExp != nil {
+		leaseExs = leaseExp.Format(time.RFC3339)
+	}
+	st.LeaseExpiresAt = leaseExs
+	st.Metadata = asset
+	st.CreatedAt = crAt.Format(time.RFC3339)
+	st.UpdatedAt = upAt.Format(time.RFC3339)
+	return st, nil
+}
+
+// ClaimNextStep atomically claims the oldest claimable step (pending, or
+// running with an expired lease) for owner in one statement: the CTE locks
+// the first candidate row FOR UPDATE so concurrent claimers skip past it
+// (SKIP LOCKED — no worker can claim the same live step), and the UPDATE
+// advances it to running under owner before returning the row.
+func (s *PostgresStore) ClaimNextStep(ctx context.Context, owner string, lease time.Duration) (domain.Step, error) {
+	if lease <= 0 {
+		return domain.Step{}, fmt.Errorf("store: claim next step for %s: lease must be positive", owner)
+	}
+	row := s.pool.QueryRow(ctx, `
+WITH claimable AS (
+    SELECT id
+    FROM workflow_steps
+    WHERE state = 'pending'
+       OR (state = 'running' AND lease_expires_at < now())
+    ORDER BY step_index
+    LIMIT 1
+    FOR UPDATE SKIP LOCKED
+)
+UPDATE workflow_steps ws
+SET state            = 'running',
+    lease_owner      = $1,
+    lease_expires_at = now() + make_interval(secs => $2),
+    attempts         = attempts + 1,
+    updated_at       = now()
+FROM claimable c
+WHERE ws.id = c.id
+RETURNING ws.id, ws.environment_id, ws.step_index, ws.kind, ws.state, ws.attempts,
+       COALESCE(ws.lease_owner, ''), ws.lease_expires_at,
+       COALESCE(ws.operation_key, ''), ws.metadata, COALESCE(ws.last_error, ''),
+       ws.created_at, ws.updated_at`, owner, lease.Seconds())
+	step, err := scanStepInto(row)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.Step{}, fmt.Errorf("store: claim next step: %w", ErrNoWork)
+		}
+		return domain.Step{}, fmt.Errorf("store: claim next step for %s: %w", owner, err)
+	}
+	return step, nil
+}
+
+// RenewLease extends owner's lease on stepID; a failure to match (expired
+// lease, stolen step, or finished step) wraps ErrNotFound.
+func (s *PostgresStore) RenewLease(ctx context.Context, stepID, owner string, lease time.Duration) error {
+	tag, err := s.pool.Exec(ctx, `
+UPDATE workflow_steps
+SET lease_expires_at = now() + make_interval(secs => $2),
+    updated_at       = now()
+WHERE id = $1 AND lease_owner = $3 AND state = 'running'`,
+		stepID, lease.Seconds(), owner)
+	if err != nil {
+		return fmt.Errorf("store: renew lease %s for %s: %w", stepID, owner, err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("store: renew lease %s for %s: %w", stepID, owner, ErrNotFound)
+	}
+	return nil
+}
+
+// CompleteStep records the outcome of a step the owner still holds. lastErr
+// is stored verbatim ("" for done); the lease is cleared so the step is no
+// longer claimable in the running branch, since done/failed rows never match.
+func (s *PostgresStore) CompleteStep(ctx context.Context, stepID, owner string, state domain.StepState, lastErr string) error {
+	if state != domain.StepDone && state != domain.StepFailed {
+		return fmt.Errorf("store: complete step %s: illegal outcome state %q", stepID, state)
+	}
+	tag, err := s.pool.Exec(ctx, `
+UPDATE workflow_steps
+SET state            = $2,
+    last_error       = $3,
+    lease_owner      = NULL,
+    lease_expires_at = NULL,
+    updated_at       = now()
+WHERE id = $1 AND lease_owner = $4 AND state = 'running'`,
+		stepID, string(state), lastErr, owner)
+	if err != nil {
+		return fmt.Errorf("store: complete step %s as %s: %w", stepID, state, err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("store: complete step %s as %s (owner %s): %w", stepID, state, owner, ErrNotFound)
+	}
+	return nil
+}
+
+// ReleaseStep returns a running step to pending, clearing its lease. Only
+// the current owner may release; if the row no longer matches (lease lost,
+// step finished), it is a no-op — the step is either reclaimed or done.
+func (s *PostgresStore) ReleaseStep(ctx context.Context, stepID, owner string) error {
+	tag, err := s.pool.Exec(ctx, `
+UPDATE workflow_steps
+SET state            = 'pending',
+    lease_owner      = NULL,
+    lease_expires_at = NULL,
+    updated_at       = now()
+WHERE id = $1 AND lease_owner = $2 AND state = 'running'`,
+		stepID, owner)
+	if err != nil {
+		return fmt.Errorf("store: release step %s: %w", stepID, err)
+	}
+	_ = tag.RowsAffected() // zero is fine: the claim was already lost or finished
+	return nil
+}
+
 // CreatePlan inserts the full forward step plan for an environment atomically.
 // Each step starts pending with its immutable index, kind, and operation_key.
 // Any (environment_id, step_index) collision errors.
@@ -232,10 +375,7 @@ RETURNING `+envColumns, params...)
 // step_index; a missing environment yields an empty slice, not NotFound.
 func (s *PostgresStore) ListForEnvironment(ctx context.Context, environmentID string) ([]domain.Step, error) {
 	rows, err := s.pool.Query(ctx, `
-SELECT id, environment_id, step_index, kind, state, attempts,
-       COALESCE(lease_owner, ''), lease_expires_at,
-       COALESCE(operation_key, ''), metadata, COALESCE(last_error, ''),
-       created_at, updated_at
+SELECT `+stepColumns+`
 FROM workflow_steps
 WHERE environment_id = $1
 ORDER BY step_index`, environmentID)

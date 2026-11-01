@@ -7,6 +7,7 @@ package store
 import (
 	"context"
 	"errors"
+	"time"
 
 	"github.com/akshat281204/provisioning-orchestrator/internal/domain"
 )
@@ -18,6 +19,9 @@ var (
 	// ErrDuplicate means a uniqueness constraint was hit — for environments
 	// that is (tenant_id, idempotency_key).
 	ErrDuplicate = errors.New("store: duplicate")
+	// ErrNoWork means no step is claimable right now: nothing is pending and
+	// no claimed step's lease has expired.
+	ErrNoWork = errors.New("store: no claimable step")
 )
 
 // EnvironmentStore persists environments.
@@ -40,4 +44,30 @@ type StepStore interface {
 	// ListForEnvironment returns the steps ordered by step_index; a missing
 	// environment yields an empty slice, not NotFound.
 	ListForEnvironment(ctx context.Context, environmentID string) ([]domain.Step, error)
+}
+
+// LeaseStore picks steps from the shared work queue and coordinates leases.
+// A step may be claimed when it is pending, or when it is running but its
+// lease has expired — the latter is the whole crash recovery mechanism.
+type LeaseStore interface {
+	// ClaimNextStep atomically claims the oldest claimable step
+	// (by step_index) for owner: pending, or running with an expired
+	// lease. It advances the step to running, sets lease_owner and
+	// lease_expires_at to now()+lease, and increments attempts. When nothing
+	// is claimable it returns an error wrapping ErrNoWork.
+	ClaimNextStep(ctx context.Context, owner string, lease time.Duration) (domain.Step, error)
+	// RenewLease extends owner's lease on stepID to now()+lease. It fails
+	// wrapping ErrNotFound when the step is not running under that owner
+	// (the lease was lost or the step finished) — renewers must stop.
+	RenewLease(ctx context.Context, stepID, owner string, lease time.Duration) error
+	// CompleteStep records an executed outcome (done or failed) for stepID
+	// while it is running under owner, clearing the lease and storing
+	// lastErr verbatim. It fails wrapping ErrNotFound when the caller does
+	// not hold the step — e.g. the lease expired and another owner took it.
+	CompleteStep(ctx context.Context, stepID, owner string, state domain.StepState, lastErr string) error
+	// ReleaseStep returns stepID to pending, clearing the lease. Used on
+	// worker shutdown so in-flight steps are not left running until their
+	// leases expire. Failing is not an error path the caller can act on:
+	// a step not held by owner is either reclaimed or already finished.
+	ReleaseStep(ctx context.Context, stepID, owner string) error
 }

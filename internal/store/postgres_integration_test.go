@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -53,6 +54,15 @@ func migrate(t *testing.T, pool *pgxpool.Pool) {
 	defer cancel()
 	if _, err := store.ApplyMigrations(ctx, pool, store.MigrateOptions{LockTimeout: 10 * time.Second}); err != nil {
 		t.Fatalf("apply migrations: %v", err)
+	}
+}
+
+// truncate wipes the domain tables so claim-ordering assertions are not
+// skewed by rows left behind by earlier (possibly failed) test runs.
+func truncate(t *testing.T, pool *pgxpool.Pool) {
+	t.Helper()
+	if _, err := pool.Exec(context.Background(), `TRUNCATE workflow_steps, environments`); err != nil {
+		t.Fatalf("truncate tables: %v", err)
 	}
 }
 
@@ -322,5 +332,207 @@ WHERE schemaname = 'public'`)
 	}
 	if err := rows.Err(); err != nil {
 		t.Fatalf("iterate tables: %v", err)
+	}
+}
+
+func seedEnvWithPlan(t *testing.T, st *store.PostgresStore, n int) domain.Environment {
+	t.Helper()
+	env := sampleEnv(t)
+	if _, err := st.CreateEnvironmentWithPlan(context.Background(), env, domain.Plan()[:n]); err != nil {
+		t.Fatalf("seed environment with plan: %v", err)
+	}
+	return env
+}
+
+// TestClaimNextStepLeaseSemantics pins the SQL claim filter against the real
+// database: live leases are invisible, expired leases are reclaimable, claims
+// come in step_index order, and an exhausted queue yields ErrNoWork.
+func TestClaimNextStepLeaseSemantics(t *testing.T) {
+	pool, st := newTestStore(t)
+	migrate(t, pool)
+	truncate(t, pool)
+	ctx := context.Background()
+
+	seedEnvWithPlan(t, st, 3)
+	const lease = 10 * time.Minute
+
+	// Steps 1 and 2 come out in step_index order, both running under w1.
+	for i := 1; i <= 2; i++ {
+		s, err := st.ClaimNextStep(ctx, "w1", lease)
+		if err != nil {
+			t.Fatalf("claim %d: %v", i, err)
+		}
+		if s.StepIndex != i {
+			t.Fatalf("claim %d returned step_index %d — claims must follow step_index order", i, s.StepIndex)
+		}
+		if s.Attempts != 1 || s.LeaseOwner != "w1" {
+			t.Fatalf("claim did not advance ownership: %+v", s)
+		}
+	}
+	// Step 3 goes to w2 — w1's live leases on 1 and 2 are invisible.
+	s3, err := st.ClaimNextStep(ctx, "w2", lease)
+	if err != nil {
+		t.Fatalf("claim step 3: %v", err)
+	}
+	if s3.StepIndex != 3 || s3.LeaseOwner != "w2" {
+		t.Fatalf("claim 3 = (%d, %s), want (3, w2)", s3.StepIndex, s3.LeaseOwner)
+	}
+
+	// Queue drained: ErrNoWork.
+	if _, err := st.ClaimNextStep(ctx, "w3", lease); !errors.Is(err, store.ErrNoWork) {
+		t.Fatalf("expected ErrNoWork on an empty queue, got %v", err)
+	}
+
+	// Unless a lease expires: then the running step is reclaimable.
+	if _, err := pool.Exec(ctx, `
+UPDATE workflow_steps
+SET lease_expires_at = now() - interval '1 second'
+WHERE step_index = 1`); err != nil {
+		t.Fatalf("expire step 1's lease: %v", err)
+	}
+	reclaimed, err := st.ClaimNextStep(ctx, "w3", lease)
+	if err != nil {
+		t.Fatalf("reclaim after expiry: %v", err)
+	}
+	if reclaimed.StepIndex != 1 || reclaimed.LeaseOwner != "w3" || reclaimed.Attempts != 2 {
+		t.Fatalf("reclaim = (%d, %s, attempts %d), want (1, w3, 2)",
+			reclaimed.StepIndex, reclaimed.LeaseOwner, reclaimed.Attempts)
+	}
+}
+
+// TestConcurrentClaimsAreUniqueOnRealSQL races claimers over a single pool of
+// pending steps on the real database: every claim must hand a distinct step
+// to its owner — two concurrent claims on the same row violate FOR UPDATE
+// SKIP LOCKED.
+func TestConcurrentClaimsAreUniqueOnRealSQL(t *testing.T) {
+	pool, st := newTestStore(t)
+	migrate(t, pool)
+	truncate(t, pool)
+	ctx := context.Background()
+
+	planLen := len(domain.Plan())
+	seedEnvWithPlan(t, st, planLen)
+
+	const claimers = 12
+	type result struct {
+		id  string
+		err error
+	}
+	results := make(chan result, claimers)
+	var wg sync.WaitGroup
+	for i := 0; i < claimers; i++ {
+		wg.Add(1)
+		go func(n int) {
+			defer wg.Done()
+			s, err := st.ClaimNextStep(ctx, fmt.Sprintf("w%d", n), time.Minute)
+			if err == nil {
+				results <- result{s.ID, nil}
+				return
+			}
+			results <- result{"", err}
+		}(i)
+	}
+	wg.Wait()
+	close(results)
+
+	ids := map[string]bool{}
+	noWork := 0
+	for r := range results {
+		if r.err == nil {
+			if ids[r.id] {
+				t.Fatalf("step %s was claimed twice concurrently", r.id)
+			}
+			ids[r.id] = true
+		} else if errors.Is(r.err, store.ErrNoWork) {
+			noWork++
+		} else {
+			t.Fatalf("unexpected claim error: %v", r.err)
+		}
+	}
+	if noWork != claimers-planLen || len(ids) != planLen {
+		t.Fatalf("got %d claims / %d ErrNoWork, want %d / %d",
+			len(ids), noWork, planLen, claimers-planLen)
+	}
+}
+
+// TestRenewLeaseAndCompleteStepGuards checks the owner guards on the real
+// SQL: only the lease holder may renew or complete, renewal extends the
+// expiry, and completion stores last_error and clears the lease.
+func TestRenewLeaseAndCompleteStepGuards(t *testing.T) {
+	pool, st := newTestStore(t)
+	migrate(t, pool)
+	truncate(t, pool)
+	ctx := context.Background()
+
+	seedEnvWithPlan(t, st, 1)
+	claim, err := st.ClaimNextStep(ctx, "w1", time.Minute)
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+
+	// A non-holder may neither renew nor complete.
+	if err := st.RenewLease(ctx, claim.ID, "w2", time.Minute); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("renew by a non-holder must be ErrNotFound, got %v", err)
+	}
+	if err := st.CompleteStep(ctx, claim.ID, "w2", domain.StepDone, ""); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("complete by a non-holder must be ErrNotFound, got %v", err)
+	}
+
+	// Renewal by the holder extends the expiry.
+	var before time.Time
+	if err := pool.QueryRow(ctx, `SELECT lease_expires_at FROM workflow_steps WHERE id = $1`, claim.ID).Scan(&before); err != nil {
+		t.Fatalf("read lease expiry: %v", err)
+	}
+	if err := st.RenewLease(ctx, claim.ID, "w1", time.Minute); err != nil {
+		t.Fatalf("renew by the holder: %v", err)
+	}
+	var after time.Time
+	if err := pool.QueryRow(ctx, `SELECT lease_expires_at FROM workflow_steps WHERE id = $1`, claim.ID).Scan(&after); err != nil {
+		t.Fatalf("read lease after renewal: %v", err)
+	}
+	if !after.After(before) {
+		t.Fatalf("renewal must extend the lease, got %v ≤ %v", after, before)
+	}
+
+	// Completion by the holder records the outcome and clears the lease.
+	if err := st.CompleteStep(ctx, claim.ID, "w1", domain.StepFailed, "adapter exploded"); err != nil {
+		t.Fatalf("complete by the holder: %v", err)
+	}
+	var state, lastErr string
+	var leaseOwner *string
+	if err := pool.QueryRow(ctx,
+		`SELECT state, last_error, lease_owner FROM workflow_steps WHERE id = $1`,
+		claim.ID).Scan(&state, &lastErr, &leaseOwner); err != nil {
+		t.Fatalf("read completed step: %v", err)
+	}
+	if state != string(domain.StepFailed) || lastErr != "adapter exploded" || leaseOwner != nil {
+		t.Fatalf("completed step = (%s, %q, %v), want failed/explicit error/NULL owner", state, lastErr, leaseOwner)
+	}
+
+	// A second completion attempt no longer matches: the step is done.
+	if err := st.CompleteStep(ctx, claim.ID, "w1", domain.StepDone, ""); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("completing a finished step must be ErrNotFound, got %v", err)
+	}
+
+	// ReleaseStep returns a held row to pending, and releasing a foreign or
+	// finished step is a silent no-op. A fresh environment seeds a fresh
+	// pending plan, because the finished step above is no longer claimable.
+	seedEnvWithPlan(t, st, 1)
+	claim2, err := st.ClaimNextStep(ctx, "wA", time.Minute)
+	if err != nil {
+		t.Fatalf("re-claim: %v", err)
+	}
+	if err := st.ReleaseStep(ctx, claim2.ID, "wB"); err != nil {
+		t.Fatalf("release by a non-holder must not error: %v", err)
+	}
+	if err := st.ReleaseStep(ctx, claim2.ID, "wA"); err != nil {
+		t.Fatalf("release by the holder: %v", err)
+	}
+	var releasedState string
+	if err := pool.QueryRow(ctx, `SELECT state FROM workflow_steps WHERE id = $1`, claim2.ID).Scan(&releasedState); err != nil {
+		t.Fatalf("read released step: %v", err)
+	}
+	if releasedState != string(domain.StepPending) {
+		t.Fatalf("released step state = %s, want pending", releasedState)
 	}
 }
