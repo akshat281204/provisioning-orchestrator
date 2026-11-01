@@ -25,8 +25,19 @@ func (c *VaultChecker) Name() string { return "vault" }
 
 // Check implements Checker.
 func (c *VaultChecker) Check(ctx context.Context) error {
-	if _, err := c.client.Sys().HealthWithContext(ctx); err != nil {
+	h, err := c.client.Sys().HealthWithContext(ctx)
+	if err != nil {
 		return fmt.Errorf("vault health: %w", err)
+	}
+	// HealthWithContext suppresses non-2xx codes for some states
+	// (uninitialized/sealed can come back as 299), so the error above
+	// alone does not prove the vault is usable. Check the reported state
+	// explicitly.
+	if !h.Initialized {
+		return fmt.Errorf("vault health: vault is not initialized")
+	}
+	if h.Sealed {
+		return fmt.Errorf("vault health: vault is sealed")
 	}
 	if _, err := c.client.Auth().Token().LookupSelfWithContext(ctx); err != nil {
 		return fmt.Errorf("vault token lookup: %w", err)

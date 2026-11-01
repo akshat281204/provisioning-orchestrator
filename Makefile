@@ -34,7 +34,12 @@ GOLINT_VERSION := v1.64.8
 
 .PHONY: lint
 lint: ## golangci-lint using the repo's .golangci.yml
-	@test -x "$(GOLINT_BIN)" || GOBIN="$(dir $(GOLINT_BIN))" $(GO) install github.com/golangci/golangci-lint/cmd/golangci-lint@$(GOLINT_VERSION)
+	@if [ -x "$(GOLINT_BIN)" ] && "$(GOLINT_BIN)" --version 2>/dev/null | grep -q "$(GOLINT_VERSION)"; \
+	then \
+		:; \
+	else \
+		GOBIN="$(dir $(GOLINT_BIN))" $(GO) install github.com/golangci/golangci-lint/cmd/golangci-lint@$(GOLINT_VERSION); \
+	fi
 	"$(GOLINT_BIN)" run
 
 .PHONY: fmt

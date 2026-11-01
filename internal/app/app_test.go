@@ -32,6 +32,9 @@ func newTestApp(t *testing.T, log *slog.Logger) *App {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
+	// Tests never call Run, so nobody else closes the pool its background
+	// health-check goroutine belongs to.
+	t.Cleanup(a.pool.Close)
 	return a
 }
 
@@ -49,6 +52,26 @@ type fakeChecker struct {
 func (f fakeChecker) Name() string { return f.name }
 
 func (f fakeChecker) Check(_ context.Context) error { return f.err }
+
+// TestNewRegistersRealDependencyCheckers protects the wiring inside New: a
+// regression that drops one of the real checkers (or renames it) must fail
+// here, not only when someone happens to notice a prod outage readout.
+func TestNewRegistersRealDependencyCheckers(t *testing.T) {
+	a := newTestApp(t, slog.New(slog.DiscardHandler))
+
+	rec := httptest.NewRecorder()
+	a.server.Handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 against unreachable dependencies, got %d", rec.Code)
+	}
+	body := rec.Body.String()
+	for _, dep := range []string{"postgres", "vault"} {
+		if !strings.Contains(body, dep) {
+			t.Fatalf("expected /readyz to name %q as failing, got %q", dep, body)
+		}
+	}
+}
 
 func TestHealthEndpointAlwaysSucceeds(t *testing.T) {
 	a := newTestApp(t, slog.New(slog.DiscardHandler))

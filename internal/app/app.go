@@ -21,6 +21,10 @@ import (
 	"github.com/akshat281204/provisioning-orchestrator/internal/health"
 )
 
+// maxRequestIDLen bounds how long a client-supplied X-Request-Id may be
+// before it is replaced with a generated id.
+const maxRequestIDLen = 64
+
 // App owns the long-lived components of the service.
 type App struct {
 	cfg      config.Config
@@ -41,10 +45,6 @@ func New(ctx context.Context, cfg config.Config, log *slog.Logger) (*App, error)
 	}
 
 	vaultCfg := vault.DefaultConfig()
-	if vaultCfg == nil {
-		pool.Close()
-		return nil, fmt.Errorf("app: create vault config for %s", cfg.VaultAddr)
-	}
 	vaultCfg.Address = cfg.VaultAddr
 	vaultClient, err := vault.NewClient(vaultCfg)
 	if err != nil {
@@ -114,8 +114,10 @@ func (a *App) Run(ctx context.Context) error {
 func (a *App) requestLogger(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		start := time.Now()
+		// Bound client-supplied request ids so a caller cannot inject
+		// unbounded content into logs and response headers.
 		reqID := req.Header.Get("X-Request-Id")
-		if reqID == "" {
+		if reqID == "" || len(reqID) > maxRequestIDLen {
 			reqID = newRequestID()
 		}
 		w.Header().Set("X-Request-Id", reqID)
@@ -135,11 +137,21 @@ func (a *App) requestLogger(next http.Handler) http.Handler {
 
 type statusRecorder struct {
 	http.ResponseWriter
-	status int
+	status      int
+	wroteHeader bool
 }
 
+// Unwrap lets http.ResponseController reach the real writer so handlers
+// that need it (Flush/Hijack) keep working through this wrapper.
+func (r *statusRecorder) Unwrap() http.ResponseWriter { return r.ResponseWriter }
+
+// WriteHeader records only the first status send; later calls are no-ops so
+// the logged status always matches what actually went on the wire.
 func (r *statusRecorder) WriteHeader(code int) {
-	r.status = code
+	if !r.wroteHeader {
+		r.status = code
+		r.wroteHeader = true
+	}
 	r.ResponseWriter.WriteHeader(code)
 }
 
@@ -165,10 +177,15 @@ func (a *App) handleHealth(w http.ResponseWriter, _ *http.Request) {
 func (a *App) handleReady(w http.ResponseWriter, r *http.Request) {
 	results := a.registry.Check(r.Context())
 	failed := health.Failed(results)
-	for _, name := range failed {
-		a.log.Warn("dependency check failed", "dependency", name, "err", results[name])
-	}
 	if len(failed) > 0 {
+		// One aggregate warning per probe; per-dependency detail goes in
+		// the log fields, not one line per name, so a long outage with a
+		// short probe interval does not spam the log.
+		failedErrs := make(map[string]string, len(failed))
+		for _, name := range failed {
+			failedErrs[name] = results[name].Error()
+		}
+		a.log.Warn("dependency checks failed", "failed", failedErrs)
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
 			"status": "unready",
 			"failed": failed,
