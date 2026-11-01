@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -28,19 +29,33 @@ type Config struct {
 	// LeaseDuration is how long a worker owns a step before another worker may
 	// reclaim it. Must be comfortably larger than StepTimeout.
 	LeaseDuration time.Duration
+	// DependencyCheckTimeout bounds a single readiness probe of a dependency,
+	// so one hung dependency cannot stall /readyz.
+	DependencyCheckTimeout time.Duration
+	// ShutdownTimeout bounds graceful shutdown: draining in-flight requests
+	// and closing dependencies.
+	ShutdownTimeout time.Duration
+	// CredentialCallers is the explicit caller-identity allowlist of the
+	// credential retrieval and rotation endpoints. This is a minimal policy
+	// (see phase 6 out-of-scope notes): any real deployment must front it
+	// with a real identity layer.
+	CredentialCallers []string
 }
 
 // Load reads configuration from the environment, applying defaults.
 func Load() (Config, error) {
 	c := Config{
-		HTTPAddr:          env("HTTP_ADDR", ":8080"),
-		DatabaseURL:       env("DATABASE_URL", "postgres://orchestrator:orchestrator@localhost:5432/orchestrator?sslmode=disable"),
-		VaultAddr:         env("VAULT_ADDR", "http://localhost:8200"),
-		VaultToken:        env("VAULT_TOKEN", "root"),
-		OTLPEndpoint:      env("OTEL_EXPORTER_OTLP_ENDPOINT", "localhost:4317"),
-		WorkerConcurrency: 4,
-		StepTimeout:       30 * time.Second,
-		LeaseDuration:     90 * time.Second,
+		HTTPAddr:               env("HTTP_ADDR", ":8080"),
+		DatabaseURL:            env("DATABASE_URL", "postgres://orchestrator:orchestrator@localhost:5432/orchestrator?sslmode=disable"),
+		VaultAddr:              env("VAULT_ADDR", "http://localhost:8200"),
+		VaultToken:             env("VAULT_TOKEN", "root"),
+		OTLPEndpoint:           env("OTEL_EXPORTER_OTLP_ENDPOINT", "localhost:4317"),
+		WorkerConcurrency:      4,
+		StepTimeout:            30 * time.Second,
+		LeaseDuration:          90 * time.Second,
+		DependencyCheckTimeout: 2 * time.Second,
+		ShutdownTimeout:        15 * time.Second,
+		CredentialCallers:      []string{"operator"},
 	}
 
 	var err error
@@ -52,6 +67,16 @@ func Load() (Config, error) {
 	}
 	if c.LeaseDuration, err = envDuration("LEASE_DURATION", c.LeaseDuration); err != nil {
 		return Config{}, err
+	}
+	if c.DependencyCheckTimeout, err = envDuration("DEPENDENCY_CHECK_TIMEOUT", c.DependencyCheckTimeout); err != nil {
+		return Config{}, err
+	}
+	if c.ShutdownTimeout, err = envDuration("SHUTDOWN_TIMEOUT", c.ShutdownTimeout); err != nil {
+		return Config{}, err
+	}
+
+	if v, ok := envCSV("CREDENTIAL_RETRIEVAL_CALLERS", c.CredentialCallers); ok {
+		c.CredentialCallers = v
 	}
 
 	if err := c.Validate(); err != nil {
@@ -79,7 +104,28 @@ func (c Config) Validate() error {
 			c.LeaseDuration, c.StepTimeout,
 		)
 	}
+	if c.DependencyCheckTimeout <= 0 {
+		return fmt.Errorf("config: dependency check timeout must be positive, got %s", c.DependencyCheckTimeout)
+	}
+	if c.ShutdownTimeout <= 0 {
+		return fmt.Errorf("config: shutdown timeout must be positive, got %s", c.ShutdownTimeout)
+	}
 	return nil
+}
+
+// envCSV reads a comma-separated list env var; missing/empty keeps def.
+func envCSV(key string, def []string) ([]string, bool) {
+	raw, ok := os.LookupEnv(key)
+	if !ok || strings.TrimSpace(raw) == "" {
+		return def, false
+	}
+	out := []string{}
+	for _, part := range strings.Split(raw, ",") {
+		if p := strings.TrimSpace(part); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out, true
 }
 
 func env(key, def string) string {
