@@ -1,0 +1,87 @@
+name: stack-order
+
+# Phase PRs are stacked branches: PR k+1 is built on PR k's branch but targets main.
+# That merges cleanly only when k is merged first. This check makes the merge button
+# honest, and re-evaluates every open phase PR whenever something lands on main so the
+# check never goes stale.
+
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: read
+  checks: write
+
+jobs:
+  stack-order:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const phaseNumber = (title) => {
+              const m = /^Phase (\d+)\s*[:—-]/.exec(title || '');
+              return m ? Number(m[1]) : null;
+            };
+
+            const open = await github.paginate(github.rest.pulls.list, {
+              ...context.repo,
+              state: 'open',
+              base: 'main',
+              per_page: 100,
+            });
+
+            const evaluate = (pr) => {
+              const n = phaseNumber(pr.title);
+              if (n === null) return null;
+              const blockers = open
+                .filter((p) => p.number !== pr.number && phaseNumber(p.title) !== null)
+                .filter((p) => phaseNumber(p.title) < n)
+                .sort((a, b) => phaseNumber(a.title) - phaseNumber(b.title));
+              return { n, blockers };
+            };
+
+            const describe = (blockers) =>
+              blockers.map((p) => `#${p.number} (Phase ${phaseNumber(p.title)})`).join(', ');
+
+            // Pull request event: this run's own check is what branch protection reads.
+            if (context.eventName === 'pull_request') {
+              const result = evaluate(context.payload.pull_request);
+              if (!result) {
+                core.info('Not a phase PR — nothing to enforce.');
+                return;
+              }
+              if (result.blockers.length) {
+                core.setFailed(
+                  `Blocked: merge ${describe(result.blockers)} first. ` +
+                  `Merging phase ${result.n} early puts commits on main out of order and breaks the stack.`
+                );
+                return;
+              }
+              core.info(`All earlier phases are merged. Phase ${result.n} is clear to merge.`);
+              return;
+            }
+
+            // Push to main: a phase just merged. Re-evaluate every other open phase PR
+            // so its check flips from failing to passing without anyone re-running it.
+            core.info(`Re-evaluating ${open.length} open PR(s) after a push to main.`);
+            for (const pr of open) {
+              const result = evaluate(pr);
+              if (!result) continue;
+
+              await github.rest.checks.create({
+                ...context.repo,
+                name: 'stack-order',
+                head_sha: pr.head.sha,
+                status: 'completed',
+                conclusion: result.blockers.length ? 'failure' : 'success',
+                output: result.blockers.length
+                  ? { title: 'Blocked', summary: `Merge ${describe(result.blockers)} first.` }
+                  : { title: 'Clear', summary: `All earlier phases are merged. Phase ${result.n} is clear to merge.` },
+              });
+              core.info(`PR #${pr.number} → ${result.blockers.length ? 'blocked' : 'clear'}`);
+            }

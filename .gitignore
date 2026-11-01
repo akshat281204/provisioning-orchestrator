@@ -1,0 +1,21 @@
+# Build output
+/bin/
+/dist/
+*.test
+*.out
+
+# Local env
+.env
+.env.local
+
+# Editor
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+
+# Agent workflow scratch (also in .git/info/exclude)
+.review/
+.stack/

@@ -1,0 +1,114 @@
+package config
+
+import (
+	"fmt"
+	"os"
+	"strconv"
+	"time"
+)
+
+// Config is the runtime configuration, assembled from the environment.
+// Every field has a usable default so `make run` works against docker-compose.
+type Config struct {
+	// HTTPAddr is the listen address for the API.
+	HTTPAddr string
+	// DatabaseURL points at the orchestrator's own Postgres instance.
+	DatabaseURL string
+	// VaultAddr is the Vault endpoint used to store provisioned credentials.
+	VaultAddr string
+	// VaultToken authenticates to Vault. In dev this is the root token.
+	VaultToken string
+	// OTLPEndpoint receives OpenTelemetry traces and metrics.
+	OTLPEndpoint string
+	// WorkerConcurrency is how many provisioning steps may run at once.
+	WorkerConcurrency int
+	// StepTimeout bounds a single provisioning step before it is considered
+	// ambiguous and must be reconciled rather than retried blindly.
+	StepTimeout time.Duration
+	// LeaseDuration is how long a worker owns a step before another worker may
+	// reclaim it. Must be comfortably larger than StepTimeout.
+	LeaseDuration time.Duration
+}
+
+// Load reads configuration from the environment, applying defaults.
+func Load() (Config, error) {
+	c := Config{
+		HTTPAddr:          env("HTTP_ADDR", ":8080"),
+		DatabaseURL:       env("DATABASE_URL", "postgres://orchestrator:orchestrator@localhost:5432/orchestrator?sslmode=disable"),
+		VaultAddr:         env("VAULT_ADDR", "http://localhost:8200"),
+		VaultToken:        env("VAULT_TOKEN", "root"),
+		OTLPEndpoint:      env("OTEL_EXPORTER_OTLP_ENDPOINT", "localhost:4317"),
+		WorkerConcurrency: 4,
+		StepTimeout:       30 * time.Second,
+		LeaseDuration:     90 * time.Second,
+	}
+
+	var err error
+	if c.WorkerConcurrency, err = envInt("WORKER_CONCURRENCY", c.WorkerConcurrency); err != nil {
+		return Config{}, err
+	}
+	if c.StepTimeout, err = envDuration("STEP_TIMEOUT", c.StepTimeout); err != nil {
+		return Config{}, err
+	}
+	if c.LeaseDuration, err = envDuration("LEASE_DURATION", c.LeaseDuration); err != nil {
+		return Config{}, err
+	}
+
+	if err := c.Validate(); err != nil {
+		return Config{}, err
+	}
+	return c, nil
+}
+
+// Validate rejects configurations that cannot work. A lease shorter than the
+// step timeout would let a healthy worker's step be stolen mid-flight, which is
+// exactly the duplicate-execution failure this service exists to avoid.
+func (c Config) Validate() error {
+	if c.DatabaseURL == "" {
+		return fmt.Errorf("config: database url is required")
+	}
+	if c.WorkerConcurrency < 1 {
+		return fmt.Errorf("config: worker concurrency must be at least 1, got %d", c.WorkerConcurrency)
+	}
+	if c.StepTimeout <= 0 {
+		return fmt.Errorf("config: step timeout must be positive, got %s", c.StepTimeout)
+	}
+	if c.LeaseDuration <= c.StepTimeout {
+		return fmt.Errorf(
+			"config: lease duration (%s) must exceed step timeout (%s) or steps will be reclaimed while still running",
+			c.LeaseDuration, c.StepTimeout,
+		)
+	}
+	return nil
+}
+
+func env(key, def string) string {
+	if v, ok := os.LookupEnv(key); ok && v != "" {
+		return v
+	}
+	return def
+}
+
+func envInt(key string, def int) (int, error) {
+	raw, ok := os.LookupEnv(key)
+	if !ok || raw == "" {
+		return def, nil
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil {
+		return 0, fmt.Errorf("config: %s must be an integer, got %q", key, raw)
+	}
+	return n, nil
+}
+
+func envDuration(key string, def time.Duration) (time.Duration, error) {
+	raw, ok := os.LookupEnv(key)
+	if !ok || raw == "" {
+		return def, nil
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		return 0, fmt.Errorf("config: %s must be a duration like 30s, got %q", key, raw)
+	}
+	return d, nil
+}

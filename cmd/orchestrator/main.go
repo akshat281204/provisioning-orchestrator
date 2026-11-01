@@ -1,0 +1,32 @@
+// Command orchestrator runs the provisioning service.
+package main
+
+import (
+	"context"
+	"log/slog"
+	"os"
+	"os/signal"
+	"syscall"
+
+	"github.com/akshat281204/provisioning-orchestrator/internal/app"
+	"github.com/akshat281204/provisioning-orchestrator/internal/config"
+)
+
+func main() {
+	log := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+
+	cfg, err := config.Load()
+	if err != nil {
+		log.Error("invalid configuration", "err", err)
+		os.Exit(1)
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	if err := app.New(cfg, log).Run(ctx); err != nil {
+		log.Error("service stopped with error", "err", err)
+		os.Exit(1)
+	}
+	log.Info("stopped cleanly")
+}

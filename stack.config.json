@@ -1,0 +1,17 @@
+{
+  "base": "main",
+  "remote": "origin",
+  "planDir": "plan",
+  "reviewDir": ".review",
+  "models": {
+    "builder": "opencode-go/gpt-6-luna",
+    "reviewer": "opencode-go/deepseek-v4-pro"
+  },
+  "agents": {
+    "builder": "builder",
+    "reviewer": "reviewer"
+  },
+  "maxReviewRounds": 3,
+  "verify": "make verify",
+  "prLabels": ["agent-stack"]
+}
