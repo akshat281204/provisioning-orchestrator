@@ -12,7 +12,7 @@ fail mid-provisioning:
 | Worker crashes mid-step | Step is lost forever | Lease expires, another worker reclaims the step and re-runs it idempotently |
 | Duplicate event delivered | Environment provisioned twice | Step execution is keyed by `(environment, step)` and guarded by a uniqueness constraint |
 | Timeout with unknown outcome | Blind retry, resource leak | Step enters `in_doubt`, is reconciled against actual state before any retry |
-| Partial failure at step 4 of 6 | Half-built environment left behind | Compensation runs the completed steps in reverse |
+| Partial failure at step 4 of 6 | Half-built environment left behind | Compensation runs a fixed, dependency-safe cleanup order |
 | Everything "succeeded" | Ready, but broken | A verification step connects as the provisioned role and runs a real query |
 
 ## Architecture
@@ -109,3 +109,5 @@ see [`plan/`](plan/) and [`docs/workflow.md`](docs/workflow.md)). What exists to
 
 `docs/architecture.md` covers the durability model in detail: why steps are leased rather
 than locked, how `in_doubt` differs from `failed`, and what makes each step idempotent.
+The normative contract — every state and legal transition, authorization, secret handling,
+and the `/v1` surface — is [`docs/design.md`](docs/design.md).
