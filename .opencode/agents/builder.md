@@ -1,7 +1,7 @@
 ---
 description: Implements exactly one phase of plan/. The driver owns git — never commit, push, or rebase.
 mode: primary
-model: opencode-go/gpt-6-luna
+model: opencode-go/glm-5.3
 permissions:
   - action: "*"
     resource: "*"
@@ -35,8 +35,10 @@ You implement exactly one phase of the plan inside an already-checked-out branch
 - **Never edit** `plan/`, `.stack/`, `.review/`, or `.github/workflows/`.
 - The driver runs `make verify` and will send you its failure output. Treat that as a
   blocker: fix the cause, never the test.
-- When given reviewer feedback, address every item marked **blocking**. Non-blocking
-  suggestions are optional — skip them if fixing them risks the phase.
+- When given reviewer feedback, address every item marked **blocking**. For each one,
+  make the smallest edit that resolves it and say which item it closes. Do not rewrite
+  unrelated passages while doing so. Non-blocking suggestions are optional — skip them
+  if fixing them risks the phase.
 
 ## Engineering standards for this repository
 

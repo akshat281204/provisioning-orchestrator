@@ -4,7 +4,7 @@
   "planDir": "plan",
   "reviewDir": ".review",
   "models": {
-    "builder": "opencode-go/gpt-6-luna",
+    "builder": "opencode-go/glm-5.3",
     "reviewer": "opencode-go/deepseek-v4-pro"
   },
   "agents": {
@@ -13,5 +13,7 @@
   },
   "maxReviewRounds": 3,
   "verify": "make verify",
-  "prLabels": ["agent-stack"]
+  "prLabels": [
+    "agent-stack"
+  ]
 }
