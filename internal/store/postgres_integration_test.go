@@ -731,6 +731,87 @@ WHERE id = $1`, c3.ID); err != nil {
 	}
 }
 
+// TestReconcileVerdictAndResumeCommitTogetherOnRealSQL pins the durability
+// guarantee the later phases build on: an environment already in in_doubt
+// whose step receives a non-in_doubt verdict has BOTH the step's final state
+// and the environment's resume out of in_doubt in the one verdict commit —
+// no crash gap can leave an in_doubt environment over an already-resolved
+// step.
+func TestReconcileVerdictAndResumeCommitTogetherOnRealSQL(t *testing.T) {
+	pool, st := newTestStore(t)
+	migrate(t, pool)
+	truncate(t, pool)
+	ctx := context.Background()
+
+	for _, tc := range []struct {
+		name    string
+		verdict domain.StepState
+	}{
+		{"done verdict", domain.StepDone},
+		{"pending verdict", domain.StepPending},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			env := sampleEnv(t)
+			if _, err := st.CreateEnvironmentWithPlan(ctx, env, domain.Plan()); err != nil {
+				t.Fatalf("seed: %v", err)
+			}
+			if err := st.BeginProvisioning(ctx, env.ID); err != nil {
+				t.Fatalf("begin provisioning: %v", err)
+			}
+			claimed, err := st.ClaimNextStep(ctx, "w1", time.Minute)
+			if err != nil {
+				t.Fatalf("claim: %v", err)
+			}
+			if err := st.CompleteStep(ctx, claimed.ID, "w1", domain.StepInDoubt, "step timed out"); err != nil {
+				t.Fatalf("record in_doubt: %v", err)
+			}
+			if err := st.MarkEnvironmentInDoubt(ctx, env.ID); err != nil {
+				t.Fatalf("mark environment in_doubt: %v", err)
+			}
+			var state string
+			if err := pool.QueryRow(ctx,
+				`SELECT state FROM environments WHERE id = $1`, env.ID).Scan(&state); err != nil {
+				t.Fatalf("read env state: %v", err)
+			}
+			if state != string(domain.EnvInDoubt) {
+				t.Fatalf("environment must be in_doubt before the verdict, got %s", state)
+			}
+
+			doubt, err := st.ClaimNextInDoubtStep(ctx, "rec1")
+			if err != nil {
+				t.Fatalf("reconciliation claim: %v", err)
+			}
+			if doubt.ID != claimed.ID {
+				t.Fatalf("reconciliation claim picked %s, want %s", doubt.ID, claimed.ID)
+			}
+			if err := st.RecordReconcileOutcome(ctx, doubt.ID, "rec1", tc.verdict, ""); err != nil {
+				t.Fatalf("record %s verdict: %v", tc.verdict, err)
+			}
+
+			// The verdict and the resume are one commit: the step carries its
+			// final state with a cleared lease, and the environment is back
+			// on its forward workflow in the same instant.
+			var stepState string
+			var owner *string
+			if err := pool.QueryRow(ctx,
+				`SELECT state, lease_owner FROM workflow_steps WHERE id = $1`, claimed.ID).Scan(&stepState, &owner); err != nil {
+				t.Fatalf("read resolved step: %v", err)
+			}
+			if stepState != string(tc.verdict) || owner != nil {
+				t.Fatalf("resolved step = (%s, %v), want %s with a cleared lease", stepState, owner, tc.verdict)
+			}
+			var resumed string
+			if err := pool.QueryRow(ctx,
+				`SELECT state FROM environments WHERE id = $1`, env.ID).Scan(&resumed); err != nil {
+				t.Fatalf("read resumed env: %v", err)
+			}
+			if resumed != string(domain.EnvProvisioning) {
+				t.Fatalf("environment after a %s verdict = %s, want provisioning", tc.verdict, resumed)
+			}
+		})
+	}
+}
+
 // TestCleanupClaimsWaitForForwardWorkAndOrderOnRealSQL pins the cleanup
 // ordering against real SQL: while a forward step of the environment is in
 // flight — live lease, expired lease, or in_doubt — no cleanup step is

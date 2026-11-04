@@ -106,10 +106,8 @@ func (s *VaultSecrets) Get(ctx context.Context, envID string) (map[string]string
 			return nil, fmt.Errorf("adapters: get secret for %s: %w", envID, ErrSecretNotFound)
 		}
 		return nil, fmt.Errorf("adapters: get secret for %s: %w", envID, err)
-	case secret == nil:
+	case secret == nil || secret.Data == nil:
 		return nil, fmt.Errorf("adapters: get secret for %s: %w", envID, ErrSecretNotFound)
-	case secret.Data == nil:
-		return nil, fmt.Errorf("adapters: get secret for %s: %w", envID, ErrSecretMalformed)
 	}
 	raw, ok := secret.Data["payload"].(map[string]any)
 	if !ok {

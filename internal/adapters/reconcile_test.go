@@ -70,9 +70,6 @@ func TestReconcileExistsAndMatchesRecordsDone(t *testing.T) {
 		{"reserve_capacity", func() *Reconciler {
 			return reconcilerWith(fakeCapacityProbe{held: true}, nil, nil, nil)
 		}, domain.KindReserveCapacity},
-		{"create_database", func() *Reconciler {
-			return reconcilerWith(nil, fakeDatabasesProbe{exists: true}, nil, nil)
-		}, domain.KindCreateDatabase},
 		{"store_credentials", func() *Reconciler {
 			envID := wantStep(domain.KindStoreCreds).EnvironmentID
 			return reconcilerWith(nil, nil, nil, fakeSecretsProbe{
@@ -128,6 +125,14 @@ func TestReconcileAbsentReturnsPending(t *testing.T) {
 		}, domain.KindReserveCapacity},
 		{"create_database (absent)", func() *Reconciler {
 			return reconcilerWith(nil, fakeDatabasesProbe{}, nil, nil)
+		}, domain.KindCreateDatabase},
+		{"create_database (present, hardening unobservable)", func() *Reconciler {
+			// The database exists, but Ensure's postcondition includes
+			// hardening, which the probe cannot observe. The row returns to
+			// pending so the idempotent Ensure re-runs and hardens, instead
+			// of a guessed done that could leave the database reachable by
+			// every role.
+			return reconcilerWith(nil, fakeDatabasesProbe{exists: true}, nil, nil)
 		}, domain.KindCreateDatabase},
 		{"store_credentials (secret absent)", func() *Reconciler {
 			return reconcilerWith(nil, nil, nil, fakeSecretsProbe{
@@ -207,8 +212,12 @@ func TestReconcileMalformedSecretIsNotTreatedAsAbsent(t *testing.T) {
 				err: fmt.Errorf("probe: %w", ErrSecretMalformed),
 			})
 			got, err := reconcileOne(t, r, wantStep(kind))
-			if err != nil || got != OutcomeFailed {
-				t.Fatalf("malformed secret: outcome=%q err=%v, want failed", got, err)
+			want := OutcomeFailed
+			if kind == domain.KindDeleteSecret {
+				want = OutcomePending
+			}
+			if err != nil || got != want {
+				t.Fatalf("malformed secret: outcome=%q err=%v, want %s", got, err, want)
 			}
 		})
 	}

@@ -269,6 +269,56 @@ func TestReconciledCleanupStepFinalizesCleanup(t *testing.T) {
 	t.Fatal("a resolved cleanup step must trigger the cleanup finalizer")
 }
 
+func TestFailedCleanupReconciliationSchedulesRetryBeforeFinalizing(t *testing.T) {
+	failed := inDoubtStep("cleanup-mismatch", 7, domain.KindDropDatabase)
+	failed.EnvironmentID = "env-cancel"
+	failed.Attempts = 1
+	st := newFakeStore(nil, failed)
+	st.cleanupEnvIDs = []string{"env-cancel"}
+	pool := &worker.Pool{
+		LeaseDuration: time.Minute,
+		StepTimeout:   time.Minute,
+		Store:         st,
+		Executor:      worker.NoopExecutor{},
+		Reconciler:    &scriptedReconciler{outcome: adapters.OutcomeFailed},
+		RetryPolicy:   worker.RetryPolicy{MaxAttempts: 3, BaseBackoff: time.Hour},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := startPool(ctx, pool)
+	defer stopPool(t, cancel, done)
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		st.mu.Lock()
+		ready := len(st.retryBackoffs) == 1
+		finalized := false
+		for _, event := range st.envEvents {
+			if event.Event == "finalize" {
+				finalized = true
+			}
+		}
+		st.mu.Unlock()
+		if ready && finalized {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	retryAt, finalizeAt := -1, -1
+	for i, event := range st.envEvents {
+		if event.Event == "schedule_retry" && retryAt < 0 {
+			retryAt = i
+		}
+		if event.Event == "finalize" && finalizeAt < 0 {
+			finalizeAt = i
+		}
+	}
+	if retryAt < 0 || finalizeAt < 0 || retryAt > finalizeAt {
+		t.Fatalf("retryable cleanup failure must be rescheduled before finalization, events: %+v", st.envEvents)
+	}
+}
+
 // TestFailedStepIsRetriedUnderCap pins the bounded retry: a failing
 // executor gets the step re-scheduled until the attempts cap, with the
 // row's attempts enforcing the budget; past the cap the step stays failed

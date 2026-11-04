@@ -838,8 +838,6 @@ WHERE id = $1 AND state = $3
 	return nil
 }
 
-// verifyStepIndex is derived from the shared plan so reconciliation routing
-// stays correct if setup steps are added or reordered.
 // hasCleanupRows reports whether the environment carries any cleanup-plan
 // rows — the durable marker that a cancellation or deletion was requested.
 func (s *PostgresStore) hasCleanupRows(ctx context.Context, environmentID string) (bool, error) {

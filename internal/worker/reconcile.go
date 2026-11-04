@@ -92,16 +92,17 @@ func (p *Pool) resumeSweep(ctx context.Context, log *slog.Logger) {
 	nctx := context.WithoutCancel(ctx)
 	// Reschedule before finalizing: a failure-to-retry crash gap must not
 	// be mistaken for exhausted cleanup and terminalized before its retry
-	// budget is considered. A listing error is logged, not returned: the
-	// retry scheduler and the cleanup finalizer are independent worklists —
-	// failing one must not delay the other's sweep by a full interval.
+	// budget is considered. A listing error aborts the sweep so a terminal
+	// verdict is never derived from worklists this pass could not read: a
+	// failed cleanup row whose retry could not be scheduled must stay
+	// retryable on the next pass, never finalized as exhausted.
 	steps, err := p.Store.ListFailedSteps(nctx)
 	if err != nil {
-		log.Warn("worker resume sweep could not list failed steps", "err", err)
-	} else {
-		for _, step := range steps {
-			p.maybeScheduleRetry(nctx, log, step)
-		}
+		log.Warn("worker resume sweep could not list failed steps, deferring the pass", "err", err)
+		return
+	}
+	for _, step := range steps {
+		p.maybeScheduleRetry(nctx, log, step)
 	}
 	envIDs, err := p.Store.ListCleanupEnvironments(nctx)
 	if err != nil {
@@ -120,6 +121,15 @@ func (p *Pool) resumeSweep(ctx context.Context, log *slog.Logger) {
 // outcome and records it. Reconcile errors leave the step in_doubt (a claim
 // displays no verdict — it just makes the inspection atomic), and the lease
 // the pass lost on a crash is no worse: the reaper returns the row.
+//
+// Ambiguity resolution is intentionally outside RetryPolicy.MaxAttempts: a
+// resolved `pending` verdict does not consume the retry budget, and a step
+// on an oscillating in_doubt → pending → in_doubt cycle is therefore not
+// capped by it. MaxAttempts bounds the error-retry schedule the executor
+// failure path uses; re-executing a step whose outcome is provably absent is
+// one observation against the world, not a new blind attempt against a
+// failing dependency. A persistently misbehaving step self-reveals as
+// repeated reconciliation verdicts in its row history.
 func (p *Pool) resolveInDoubt(ctx context.Context, log *slog.Logger, step domain.Step) {
 	outcome, err := p.Reconciler.Reconcile(ctx, step)
 	if err != nil {
@@ -180,7 +190,7 @@ func (p *Pool) recordReconcileOutcome(
 		log.Error("worker reconciliation could not record the outcome",
 			"step_id", step.ID, "state", state, "err", err)
 	}
-	if err == nil && state != domain.StepInDoubt && isCleanupKind(step.Kind) {
+	if err == nil && state != domain.StepInDoubt && state != domain.StepFailed && isCleanupKind(step.Kind) {
 		p.maybeFinalizeCleanup(nctx, log, step)
 	}
 }

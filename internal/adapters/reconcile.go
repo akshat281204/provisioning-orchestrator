@@ -107,7 +107,15 @@ func (r *Reconciler) Reconcile(ctx context.Context, step domain.Step) (Reconcile
 			return "", fmt.Errorf("reconcile %s (%s): %w", step.Kind, step.ID, err)
 		}
 		if step.Kind == domain.KindCreateDatabase {
-			return heldOutcome(exists), nil
+			// Existence is NOT the postcondition of create_database: the
+			// executor's Ensure also hardens the database (revokes PUBLIC
+			// database grants and PUBLIC CREATE on the schema) and seals the
+			// control databases. A timeout after CREATE DATABASE but before
+			// harden would leave the database reachable by every role —
+			// cross-environment isolation loss — so a merely-present database
+			// is not "exists-and-matches". The idempotent Ensure re-runs and
+			// hardens instead of trusting a guessed done.
+			return OutcomePending, nil
 		}
 		// drop_database: a still-present database means cleanup has not run.
 		if exists {
@@ -183,7 +191,9 @@ func (r *Reconciler) Reconcile(ctx context.Context, step domain.Step) (Reconcile
 			// never needed) and the cleanup step is done.
 			return OutcomeDone, nil
 		case errors.Is(err, ErrSecretMalformed):
-			return OutcomeFailed, nil
+			// The path exists, so deleting it is still the safe idempotent
+			// action even if its payload cannot be decoded.
+			return OutcomePending, nil
 		case err != nil:
 			return "", fmt.Errorf("reconcile delete_secret (%s): %w", step.ID, err)
 		default:
