@@ -17,13 +17,80 @@ import (
 	vault "github.com/hashicorp/vault/api"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/akshat281204/provisioning-orchestrator/internal/adapters"
 	"github.com/akshat281204/provisioning-orchestrator/internal/config"
 	"github.com/akshat281204/provisioning-orchestrator/internal/health"
+	"github.com/akshat281204/provisioning-orchestrator/internal/httpapi"
+	"github.com/akshat281204/provisioning-orchestrator/internal/store"
+	"github.com/akshat281204/provisioning-orchestrator/internal/worker"
 )
 
 // maxRequestIDLen bounds how long a client-supplied X-Request-Id may be
 // before it is replaced with a generated id.
 const maxRequestIDLen = 64
+
+// Retry and reconciliation bounds for the production pool: a failed step is
+// retried up to maxStepAttempts leases burned (row-counted, so a restart
+// inherits the same budget), with exponential backoff capped at
+// retryMaxBackoff, and in_doubt steps are re-asked every reconcileInterval.
+const (
+	maxStepAttempts   = 5
+	retryBaseBackoff  = 2 * time.Second
+	retryMaxBackoff   = 30 * time.Second
+	reconcileInterval = 15 * time.Second
+)
+
+// newWorkerPool builds the lease pool and its real executor. The Postgres
+// adapters share the app's pool and drive their DDL with the same
+// credentials; Vault holds the provisioned credentials under its default
+// dev-mode mount.
+func newWorkerPool(
+	cfg config.Config, pool *pgxpool.Pool, vaultClient *vault.Client, log *slog.Logger,
+) *worker.Pool {
+	capacity := adapters.NewLocalCapacity(pool, log)
+	databases := adapters.NewLocalDatabases(pool, cfg.DatabaseURL, log)
+	roles := adapters.NewLocalRoles(pool, cfg.DatabaseURL, log)
+	secrets := adapters.NewVaultSecrets(vaultClient, "secret")
+	secrets.Log = log
+	// The orchestrator store is the state machine's window for the worker:
+	// verification drives pending/provisioning/verifying forward, and only
+	// the store's CompleteVerification transaction can write `ready`.
+	st := store.NewPostgresStore(pool)
+	return &worker.Pool{
+		Concurrency:   cfg.WorkerConcurrency,
+		LeaseDuration: cfg.LeaseDuration,
+		StepTimeout:   cfg.StepTimeout,
+		Store:         st,
+		// Reconciliation of in_doubt steps: the read-only probes ask the
+		// same adapters the executor drives, minus every mutating call,
+		// so "looking" can never become "doing".
+		Reconciler: &adapters.Reconciler{
+			Capacity:  capacity,
+			Databases: databases,
+			Roles:     roles,
+			Secrets:   secrets,
+			Log:       log,
+		},
+		// Startup pass runs a fresh pass every interval; the default pick
+		// keeps a dead worker's ambiguity visible for at most a minute or
+		// so without churning the database.
+		RetryPolicy: worker.RetryPolicy{
+			MaxAttempts: maxStepAttempts,
+			BaseBackoff: retryBaseBackoff,
+			MaxBackoff:  retryMaxBackoff,
+		},
+		ReconcileInterval: reconcileInterval,
+		Executor: &worker.AdapterExecutor{
+			Capacity:  capacity,
+			Databases: databases,
+			Roles:     roles,
+			Secrets:   secrets,
+			Verifier:  adapters.NewLocalVerifier(cfg.DatabaseURL),
+			Envs:      st,
+		},
+		Log: log,
+	}
+}
 
 // App owns the long-lived components of the service.
 type App struct {
@@ -32,6 +99,7 @@ type App struct {
 	server   *http.Server
 	registry *health.Registry
 	pool     *pgxpool.Pool
+	workers  *worker.Pool
 }
 
 // New builds the application without starting anything. The Postgres pool
@@ -61,11 +129,28 @@ func New(ctx context.Context, cfg config.Config, log *slog.Logger) (*App, error)
 			health.NewVaultChecker(vaultClient),
 		),
 		pool: pool,
+		// The worker pool shares the API's database pool: steps advance with
+		// no central scheduler, claiming rows from the same tables the HTTP
+		// API writes. Steps run through the phase-5 adapters; every
+		// operation is idempotent, so retries after crashes converge.
+		workers: newWorkerPool(cfg, pool, vaultClient, log),
 	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", a.handleHealth)
 	mux.HandleFunc("GET /readyz", a.handleReady)
+
+	// The /v1 surface is served by its own package against the same pool a
+	// worker (later phases) will claim work from.
+	v1 := httpapi.New(store.NewPostgresStore(pool))
+	v1.AttachCredentials(
+		adapters.NewVaultSecrets(vaultClient, "secret"),
+		adapters.NewLocalRoles(pool, cfg.DatabaseURL, log),
+		adapters.NewLocalVerifier(cfg.DatabaseURL),
+		httpapi.NewCredentialPolicy(cfg.CredentialCallers...),
+		log,
+	)
+	mux.Handle("/v1/", http.StripPrefix("/v1", v1.Handler()))
 
 	a.server = &http.Server{
 		Addr:              cfg.HTTPAddr,
@@ -92,6 +177,16 @@ func (a *App) Run(ctx context.Context) error {
 		}
 	}()
 
+	// The worker pool runs for the lifetime of the app and exits when ctx
+	// is cancelled, releasing any in-flight step back to pending.
+	workersDone := make(chan struct{})
+	go func() {
+		defer close(workersDone)
+		if err := a.workers.Run(ctx); err != nil {
+			a.log.Error("worker pool stopped with error", "err", err)
+		}
+	}()
+
 	select {
 	case err := <-errCh:
 		return err
@@ -104,6 +199,13 @@ func (a *App) Run(ctx context.Context) error {
 	//nolint:contextcheck // graceful shutdown needs a context detached from the cancelled run ctx
 	if err := a.server.Shutdown(shutdownCtx); err != nil {
 		return fmt.Errorf("app: graceful shutdown: %w", err)
+	}
+	// Draining requests first lets in-flight API calls finish; the pool then
+	// releases its steps before the pgx pool closes (deferred above).
+	select {
+	case <-workersDone:
+	case <-shutdownCtx.Done():
+		return fmt.Errorf("app: worker pool did not stop in time")
 	}
 	return nil
 }
