@@ -17,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/akshat281204/provisioning-orchestrator/internal/adapters"
 	"github.com/akshat281204/provisioning-orchestrator/internal/domain"
 	"github.com/akshat281204/provisioning-orchestrator/internal/store"
 )
@@ -32,6 +33,22 @@ type Store interface {
 	// here, a verification that never succeeds can never lend its readiness.
 	CompleteVerification(ctx context.Context, stepID, owner, environmentID string) error
 	ReleaseStep(ctx context.Context, stepID, owner string) error
+	// Reconcile and retry bookkeeping (phase 7): the ambiguous-outcome
+	// claim path, durable rescheduling of failed steps, the environment's
+	// in_doubt hops, and the cleanup finalizer. See store.ReconcileStore.
+	ClaimNextInDoubtStep(ctx context.Context, owner string) (domain.Step, error)
+	ScheduleRetry(ctx context.Context, stepID string, delay time.Duration) error
+	MarkEnvironmentInDoubt(ctx context.Context, environmentID string) error
+	ResumeFromInDoubt(ctx context.Context, environmentID string, stepIndex int) error
+	FinalizeCleanup(ctx context.Context, environmentID string) error
+}
+
+// Reconciler decides the outcome of an in_doubt step by looking at the real
+// world (internal/adapters.Reconciler). Reconciliation may never record a
+// guess: an error from Reconcile means "unobservable" and the step stays
+// in_doubt for a later pass.
+type Reconciler interface {
+	Reconcile(ctx context.Context, step domain.Step) (adapters.ReconcileOutcome, error)
 }
 
 // Executor performs one step's external work. Phase 5 swaps the real

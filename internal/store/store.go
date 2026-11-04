@@ -26,7 +26,23 @@ var (
 	// rotation lock; the caller must not mutate Vault or the role concurrently
 	// with it.
 	ErrRotationBusy = errors.New("store: rotation already in progress")
+	// ErrIllegalTransition means the environment's persisted state does not
+	// allow the requested move (e.g. deleting a deleted or rolled-back
+	// environment). HTTP surfaces map it onto a 409, not a 500.
+	ErrIllegalTransition = errors.New("store: illegal state transition")
 )
+
+// CleanupStore begins the durable cleanup workflow for an environment.
+type CleanupStore interface {
+	// BeginCleanup moves the environment to `target` (cancelling or
+	// deleting) and records the compensation steps (the cleanup plan) as
+	// rows in the same transaction, so an environment is never reported
+	// deleted while cleanup is pending and a cancellation never loses its
+	// compensation plan. It is idempotent: repeating the call re-routes or
+	// completes, never writes a second plan. A move the state machine
+	// rejects wraps ErrIllegalTransition.
+	BeginCleanup(ctx context.Context, environmentID string, target domain.EnvState) (domain.Environment, error)
+}
 
 // EnvironmentStore persists environments.
 type EnvironmentStore interface {
@@ -74,6 +90,38 @@ type LeaseStore interface {
 	// leases expire. Failing is not an error path the caller can act on:
 	// a step not held by owner is either reclaimed or already finished.
 	ReleaseStep(ctx context.Context, stepID, owner string) error
+}
+
+// ReconcileStore handles the two phase-7 paths the ordinary claim loop must
+// never touch: the resolution of `in_doubt` steps against the real world,
+// and the retry/counterfactual bookkeeping around a failed step.
+type ReconcileStore interface {
+	// ClaimNextInDoubtStep claims the oldest `in_doubt` step for owner,
+	// advancing it to running so its outcome can be reconciled. `in_doubt`
+	// steps are invisible to ClaimNextStep; this is the only claim path
+	// that touches them. It returns an error wrapping ErrNoWork when none
+	// are left.
+	ClaimNextInDoubtStep(ctx context.Context, owner string) (domain.Step, error)
+	// ScheduleRetry returns a FAILED step to pending with its lease set to
+	// now()+delay, which makes it unclaimable until the backoff elapses
+	// (ClaimNextStep only claims a pending row whose lease is empty or
+	// expired). The delay is the durable backoff marker, not process state.
+	ScheduleRetry(ctx context.Context, stepID string, delay time.Duration) error
+	// MarkEnvironmentInDoubt moves the environment to in_doubt when one of
+	// its steps resolved to unknown. Illegal edges (the state machine has
+	// no in_doubt successor for the current state) are silently ignored:
+	// the step's own in_doubt state still records the ambiguity.
+	MarkEnvironmentInDoubt(ctx context.Context, environmentID string) error
+	// ResumeFromInDoubt moves an in_doubt environment back to provisioning
+	// (step index < verify) or verifying (the verify step itself) once its
+	// ambiguous step has been reconciled. Non-in_doubt environments pass
+	// through unchanged.
+	ResumeFromInDoubt(ctx context.Context, environmentID string, stepIndex int) error
+	// FinalizeCleanup inspects a deleting/cancelling/failed environment's
+	// cleanup steps and closes the workflow: every step done → terminal
+	// (deleted or cancelled); any step failed → failed. It is safe to call
+	// repeatedly and is a no-op for environments not on a cleanup path.
+	FinalizeCleanup(ctx context.Context, environmentID string) error
 }
 
 // StateStore moves environments along their state machine. Every move is a

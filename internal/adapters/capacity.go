@@ -111,6 +111,19 @@ func (c *LocalCapacity) Release(ctx context.Context, envID string) error {
 	return nil
 }
 
+// Held reports whether envID currently holds a capacity reservation. It is
+// the reconciler's probe for reserve_capacity: the step's outcome is unknown
+// exactly when this answer decides it.
+func (c *LocalCapacity) Held(ctx context.Context, envID string) (bool, error) {
+	var held bool
+	if err := c.pool.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM capacity_reservations WHERE environment_id = $1)`,
+		envID).Scan(&held); err != nil {
+		return false, fmt.Errorf("adapters: check capacity reservation %s: %w", envID, err)
+	}
+	return held, nil
+}
+
 // logger substitutes a discard handler so log calls are nil-safe.
 func (c *LocalCapacity) logger() *slog.Logger {
 	if c.log == nil {

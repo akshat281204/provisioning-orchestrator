@@ -10,6 +10,8 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"strings"
+
 	"github.com/akshat281204/provisioning-orchestrator/internal/domain"
 )
 
@@ -26,6 +28,8 @@ var (
 	_ StepStore        = (*PostgresStore)(nil)
 	_ LeaseStore       = (*PostgresStore)(nil)
 	_ StateStore       = (*PostgresStore)(nil)
+	_ ReconcileStore   = (*PostgresStore)(nil)
+	_ CleanupStore     = (*PostgresStore)(nil)
 )
 
 // NewPostgresStore builds a store on top of an existing pool. The caller
@@ -196,24 +200,56 @@ func scanStepInto(row pgx.Row) (domain.Step, error) {
 	return st, nil
 }
 
+// cleanupKindWhere is the SQL IN-list of cleanup step kinds, derived from
+// domain.CleanupPlan at init so the claim query and the domain cannot drift.
+var cleanupKindWhere = func() string {
+	names := make([]string, len(domain.CleanupPlan))
+	for i, k := range domain.CleanupPlan {
+		names[i] = "'" + string(k) + "'"
+	}
+	return "(" + strings.Join(names, ",") + ")"
+}()
+
+// claimableWhere is the shared predicate of the ordinary claim path. A step
+// is claimable when it is pending with its backoff lease elapsed, or running
+// with an expired lease (crash recovery); what it must never be is
+// `in_doubt` — an unknown outcome is resolved by reconciliation, never by
+// blind re-execution. Cleanup kinds run only while their environment is on
+// a cleanup path (cancelling, deleting) or carrying a cleanup failure
+// (failed); forward kinds are frozen the moment cleanup or cancellation
+// begins, so cancelling stops scheduling new provisioning work while
+// in-flight steps finish.
+const claimableWhere = `((ws.state = 'pending'
+            AND (ws.lease_expires_at IS NULL OR ws.lease_expires_at < now()))
+        OR (ws.state = 'running' AND ws.lease_expires_at < now()))
+    AND ((ws.kind NOT IN %[1]s AND e.state NOT IN ('cancelling', 'cancelled', 'deleting', 'deleted'))
+        OR (ws.kind IN %[1]s AND e.state IN ('cancelling', 'deleting', 'failed')))`
+
+// cleanupFilterWhere matches the cleanup-plan rows of an environment's
+// workflow_steps table.
+var cleanupFilterWhere = "kind IN " + cleanupKindWhere
+
 // ClaimNextStep atomically claims the oldest claimable step (pending, or
 // running with an expired lease) for owner in one statement: the CTE locks
 // the first candidate row FOR UPDATE so concurrent claimers skip past it
 // (SKIP LOCKED — no worker can claim the same live step), and the UPDATE
-// advances it to running under owner before returning the row.
+// advances it to running under owner before returning the row. `in_doubt`
+// steps are structurally unclaimable here — a pending row with a floating
+// backoff lease is also skipped until its delay elapses.
 func (s *PostgresStore) ClaimNextStep(ctx context.Context, owner string, lease time.Duration) (domain.Step, error) {
 	if lease <= 0 {
 		return domain.Step{}, fmt.Errorf("store: claim next step for %s: lease must be positive", owner)
 	}
+	where := fmt.Sprintf(claimableWhere, cleanupKindWhere)
 	row := s.pool.QueryRow(ctx, `
 WITH claimable AS (
-    SELECT id
-    FROM workflow_steps
-    WHERE state = 'pending'
-       OR (state = 'running' AND lease_expires_at < now())
-    ORDER BY step_index
+    SELECT ws.id
+    FROM workflow_steps ws
+    JOIN environments e ON e.id = ws.environment_id
+    WHERE `+where+`
+    ORDER BY ws.step_index
     LIMIT 1
-    FOR UPDATE SKIP LOCKED
+    FOR UPDATE OF ws SKIP LOCKED
 )
 UPDATE workflow_steps ws
 SET state            = 'running',
@@ -256,10 +292,14 @@ WHERE id = $1 AND lease_owner = $3 AND state = 'running'`,
 }
 
 // CompleteStep records the outcome of a step the owner still holds. lastErr
-// is stored verbatim ("" for done); the lease is cleared so the step is no
-// longer claimable in the running branch, since done/failed rows never match.
+// is stored verbatim ("" for done). Besides done and failed it accepts
+// in_doubt: a step whose execution context expired mid-flight has an unknown
+// outcome, and recording the ambiguity — not a verdict — is the point. The
+// lease is cleared either way so the step is no longer claimable in the
+// running branch; in_doubt rows are likewise invisible to the ordinary
+// claim (only ClaimNextInDoubtStep touches them).
 func (s *PostgresStore) CompleteStep(ctx context.Context, stepID, owner string, state domain.StepState, lastErr string) error {
-	if state != domain.StepDone && state != domain.StepFailed {
+	if state != domain.StepDone && state != domain.StepFailed && state != domain.StepInDoubt {
 		return fmt.Errorf("store: complete step %s: illegal outcome state %q", stepID, state)
 	}
 	tag, err := s.pool.Exec(ctx, `
@@ -425,7 +465,310 @@ ORDER BY step_index`, environmentID)
 	return steps, nil
 }
 
-// ---- Environment state machine (phase 6) ----
+// ClaimNextInDoubtStep is the reconciliation claim path: it claims the oldest
+// `in_doubt` step (any lease state — recording the ambiguity cleared it) by
+// advancing it to running under owner. This is the ONLY claim query that
+// touches in_doubt rows, so an unknown outcome is never re-executed by the
+// ordinary worker pool.
+func (s *PostgresStore) ClaimNextInDoubtStep(ctx context.Context, owner string) (domain.Step, error) {
+	row := s.pool.QueryRow(ctx, `
+WITH claimable AS (
+    SELECT id FROM workflow_steps
+    WHERE state = 'in_doubt'
+    ORDER BY step_index
+    LIMIT 1
+    FOR UPDATE SKIP LOCKED
+)
+UPDATE workflow_steps ws
+SET state            = 'running',
+    lease_owner      = $1,
+    lease_expires_at = now() + make_interval(secs => $2),
+    updated_at       = now()
+FROM claimable c
+WHERE ws.id = c.id
+RETURNING ws.id, ws.environment_id, ws.step_index, ws.kind, ws.state, ws.attempts,
+       COALESCE(ws.lease_owner, ''), ws.lease_expires_at,
+       COALESCE(ws.operation_key, ''), ws.metadata, COALESCE(ws.last_error, ''),
+       ws.created_at, ws.updated_at`, owner, inDoubtLease.Seconds())
+	step, err := scanStepInto(row)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.Step{}, fmt.Errorf("store: claim next in_doubt step: %w", ErrNoWork)
+		}
+		return domain.Step{}, fmt.Errorf("store: claim next in_doubt step for %s: %w", owner, err)
+	}
+	return step, nil
+}
+
+// inDoubtLease is the lease a reconciler holds while resolving an in_doubt
+// step. It must be renewed or resolved promptly so a dead reconciler's claim
+// is still visible; a periodic pass reclaims expired ones.
+const inDoubtLease = 60 * time.Second
+
+// ScheduleRetry returns a failed step to pending with its backoff lease set
+// to now()+delay: the row becomes claimable again only after the delay, and
+// the delay lives in the ROW, so a crash between the failure and the retry
+// inherits the same backoff rather than hammering the dependency. Only a
+// `failed` row may be rescheduled — a running one is someone's live work; a
+// done one is finished. A no-op volume (0 rows) means the step moved on
+// elsewhere, which is fine.
+func (s *PostgresStore) ScheduleRetry(ctx context.Context, stepID string, delay time.Duration) error {
+	if delay < 0 {
+		return fmt.Errorf("store: schedule retry %s: negative delay %s", stepID, delay)
+	}
+	_, err := s.pool.Exec(ctx, `
+UPDATE workflow_steps
+SET state = 'pending',
+    lease_owner = NULL,
+    lease_expires_at = now() + make_interval(secs => $2),
+    updated_at = now()
+WHERE id = $1 AND state = 'failed'`, stepID, delay.Seconds())
+	if err != nil {
+		return fmt.Errorf("store: schedule retry %s: %w", stepID, err)
+	}
+	return nil
+}
+
+// MarkEnvironmentInDoubt CAS-moves the environment to in_doubt after one of
+// its steps recorded an unknown outcome. A state with no legal in_doubt edge
+// is passed through silently: the step row already carries the ambiguity,
+// and inventing an illegal environment move would corrupt the machine.
+func (s *PostgresStore) MarkEnvironmentInDoubt(ctx context.Context, environmentID string) error {
+	state, err := s.envStateFor(ctx, environmentID)
+	if err != nil {
+		return err
+	}
+	if !domain.CanTransition(state, domain.EnvInDoubt) {
+		return nil
+	}
+	return s.transitionEnv(ctx, environmentID, state, domain.EnvInDoubt)
+}
+
+// ResumeFromInDoubt moves an in_doubt environment back into its workflow
+// once the ambiguous step was reconciled: steps before the verify index go
+// to provisioning, the verify step itself to verifying. Any other current
+// state passes through unchanged, and an illegal edge (a concurrent move
+// won) surfaces as a logged no-op upstream.
+func (s *PostgresStore) ResumeFromInDoubt(ctx context.Context, environmentID string, stepIndex int) error {
+	state, err := s.envStateFor(ctx, environmentID)
+	if err != nil {
+		return err
+	}
+	if state != domain.EnvInDoubt {
+		return nil
+	}
+	target := domain.EnvProvisioning
+	if stepIndex >= verifyStepIndex {
+		target = domain.EnvVerifying
+	}
+	if !domain.CanTransition(state, target) {
+		return nil
+	}
+	return s.transitionEnv(ctx, environmentID, state, target)
+}
+
+// verifyStepIndex is the 1-based plan position of the verify_usable step.
+const verifyStepIndex = 6
+
+// BeginCleanup moves the environment to cancelling or deleting and makes
+// sure the compensation steps exist, in one transaction: the plan rows land
+// together with the state move, so a crash between them leaves either the
+// old honest state or a fully armed cleanup — never a deleting environment
+// with no cleanup plan. Rows are created ON CONFLICT DO NOTHING style (checked
+// first), so repeating the call (a second DELETE, a cancelled DELETE retried,
+// a worker restart) never writes a second plan; a cleanup step wedged in
+// `failed` is re-armed to pending so the retry the caller asked for is real.
+func (s *PostgresStore) BeginCleanup(
+	ctx context.Context, environmentID string, target domain.EnvState,
+) (domain.Environment, error) {
+	if target != domain.EnvDeleting && target != domain.EnvCancelling {
+		return domain.Environment{}, fmt.Errorf("store: begin cleanup %s: target must be deleting or cancelling, got %q",
+			environmentID, target)
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return domain.Environment{}, fmt.Errorf("store: begin cleanup %s: begin: %w", environmentID, err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var state string
+	err = tx.QueryRow(ctx, `SELECT state FROM environments WHERE id = $1 FOR UPDATE`, environmentID).Scan(&state)
+	if err != nil {
+		return domain.Environment{}, mapError(fmt.Sprintf("store: begin cleanup %s", environmentID), err)
+	}
+	current := domain.EnvState(state)
+	if !current.Valid() {
+		return domain.Environment{}, fmt.Errorf("store: begin cleanup %s: unknown persisted state %q", environmentID, state)
+	}
+	if current == target {
+		// Already on this cleanup path: fall through to re-arming wedged
+		// rows (below), which turns a repeated DELETE into a real retry.
+	} else {
+		if !domain.CanTransition(current, target) {
+			return domain.Environment{}, fmt.Errorf(
+				"store: begin cleanup %s: %w: illegal %q -> %q",
+				environmentID, ErrIllegalTransition, current, target)
+		}
+		if _, err := tx.Exec(ctx, `
+UPDATE environments
+SET state = $2, updated_at = now(),
+    metadata = `+timelineSQL+`
+WHERE id = $1 AND state = $3`,
+			environmentID, string(target), string(current)); err != nil {
+			return domain.Environment{}, fmt.Errorf("store: begin cleanup %s: %w", environmentID, err)
+		}
+	}
+
+	// Re-arm failed cleanup steps (one wedged step must not block its
+	// siblings' retry either), then insert the plan rows for environments
+	// that have no cleanup rows yet. Both are idempotent.
+	if _, err := tx.Exec(ctx, `
+UPDATE workflow_steps
+SET state = 'pending', lease_owner = NULL, lease_expires_at = NULL, updated_at = now()
+WHERE environment_id = $1 AND state = 'failed' AND `+cleanupFilterWhere, environmentID); err != nil {
+		return domain.Environment{}, fmt.Errorf("store: begin cleanup %s: re-arm failed steps: %w", environmentID, err)
+	}
+	// Cleanup rows are indexed after the forward plan; a second BeginCleanup
+	// collides on UNIQUE (environment_id, step_index) only if it wrote them
+	// itself earlier, in which case nothing needs writing.
+	cleanupSteps := make([]domain.PlannedStep, len(domain.CleanupPlan))
+	for i, kind := range domain.CleanupPlan {
+		cleanupSteps[i] = domain.PlannedStep{Index: cleanupStepIndex(i), Kind: kind}
+	}
+	if err := insertPlan(ctx, tx, environmentID, cleanupSteps); err != nil && !errors.Is(err, ErrDuplicate) {
+		return domain.Environment{}, fmt.Errorf("store: begin cleanup %s: %w", environmentID, err)
+	}
+
+	env, err := readEnvTx(ctx, tx, environmentID)
+	if err != nil {
+		return domain.Environment{}, fmt.Errorf("store: begin cleanup %s: %w", environmentID, err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return domain.Environment{}, fmt.Errorf("store: begin cleanup %s: commit: %w", environmentID, err)
+	}
+	return env, nil
+}
+
+// forwardStepCount is the number of steps in the forward plan; cleanup steps
+// are indexed immediately after it.
+var forwardStepCount = len(domain.Plan())
+
+// cleanupStepIndex gives cleanup plan step i (0-based) its immutable
+// workflow_steps index, right after the forward plan's 1..6.
+func cleanupStepIndex(i int) int { return forwardStepCount + i + 1 }
+
+// FinalizeCleanup closes a cleanup workflow: while the environment is
+// deleting, cancelling, or carrying a cleanup failure it inspects the
+// cleanup rows and moves the environment when the whole compensation plan
+// has a verdict — every row done → terminal (deleted / cancelled), any row
+// failed → failed. Partial progress leaves the state alone (the env keeps
+// reporting `deleting` with progress). The state CAS guards each hop.
+func (s *PostgresStore) FinalizeCleanup(ctx context.Context, environmentID string) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("store: finalize cleanup %s: begin: %w", environmentID, err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var state string
+	err = tx.QueryRow(ctx, `SELECT state FROM environments WHERE id = $1 FOR UPDATE`, environmentID).Scan(&state)
+	if err != nil {
+		return mapError(fmt.Sprintf("store: finalize cleanup %s", environmentID), err)
+	}
+	current := domain.EnvState(state)
+	onCleanup := current == domain.EnvDeleting || current == domain.EnvCancelling || current == domain.EnvFailed
+	if !onCleanup {
+		// Nothing to finalize; not an error — callers invoke this after
+		// every cleanup step without checking the global state first.
+		_ = tx.Rollback(ctx)
+		return nil
+	}
+
+	// The verdict is derived from exactly the cleanup kinds, never from a
+	// forward step that outlived the request.
+	var doneCount, failedCount int
+	err = tx.QueryRow(ctx, `
+SELECT count(*) FILTER (WHERE state = 'done'),
+       count(*) FILTER (WHERE state = 'failed')
+FROM workflow_steps
+WHERE environment_id = $1 AND `+cleanupFilterWhere, environmentID).Scan(&doneCount, &failedCount)
+	if err != nil {
+		return fmt.Errorf("store: finalize cleanup %s: %w", environmentID, err)
+	}
+	// There must be a full cleanup plan; an orphan without one has nothing
+	// to wait for and is finalized as if it were done.
+	if doneCount+failedCount < len(domain.CleanupPlan) {
+		_ = tx.Rollback(ctx)
+		return nil
+	}
+
+	switch {
+	case failedCount > 0:
+		// A cleanup step that keeps failing stays visible as failed and the
+		// environment reports failed — never deleted while cleanup failed.
+		if current == domain.EnvFailed || !domain.CanTransition(current, domain.EnvFailed) {
+			_ = tx.Rollback(ctx)
+			return nil
+		}
+		if _, err := tx.Exec(ctx, `
+UPDATE environments
+SET state = $2, updated_at = now(), metadata = `+timelineSQL+`
+WHERE id = $1 AND state = $3`,
+			environmentID, string(domain.EnvFailed), string(current)); err != nil {
+			return fmt.Errorf("store: finalize cleanup %s: mark failed: %w", environmentID, err)
+		}
+	case failedCount == 0 && doneCount == len(domain.CleanupPlan):
+		// The failed→deleted path walks the legal edge failed->deleting
+		// first, so the machine is never asked for an illegal move.
+		if current == domain.EnvFailed {
+			if _, err := tx.Exec(ctx, `
+UPDATE environments
+SET state = $2, updated_at = now(), metadata = `+timelineSQL+`
+WHERE id = $1 AND state = $3`,
+				environmentID, string(domain.EnvDeleting), string(current)); err != nil {
+				return fmt.Errorf("store: finalize cleanup %s: re-route failed to deleting: %w", environmentID, err)
+			}
+			current = domain.EnvDeleting
+		}
+		terminal := domain.EnvDeleted
+		if current == domain.EnvCancelling {
+			terminal = domain.EnvCancelled
+		}
+		if _, err := tx.Exec(ctx, `
+UPDATE environments
+SET state = $2, updated_at = now(), metadata = `+timelineSQL+`
+WHERE id = $1 AND state = $3`,
+			environmentID, string(terminal), string(current)); err != nil {
+			return fmt.Errorf("store: finalize cleanup %s: close to %s: %w", environmentID, terminal, err)
+		}
+	default:
+		_ = tx.Rollback(ctx)
+		return nil
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("store: finalize cleanup %s: commit: %w", environmentID, err)
+	}
+	return nil
+}
+
+// timelineSQL is the metadata fragment that appends one compact,
+// inherently-redacted audit entry ({state, at}) to the metadata jsonb. Only
+// state names and timestamps are recorded — no request body, no error text,
+// no credential material — so the timeline can never leak a secret.
+const timelineSQL = `jsonb_set(metadata, '{timeline}',
+    COALESCE(metadata->'timeline', '[]'::jsonb) || jsonb_build_array(
+        jsonb_build_object('state', $2, 'at', now())))`
+
+// readEnvTx reads one environment inside an open transaction.
+func readEnvTx(ctx context.Context, tx pgx.Tx, environmentID string) (domain.Environment, error) {
+	row := tx.QueryRow(ctx, `SELECT `+envColumns+` FROM environments WHERE id = $1`, environmentID)
+	env, err := scanEnvInto(row)
+	if err != nil {
+		return domain.Environment{}, mapError(fmt.Sprintf("store: read environment %s", environmentID), err)
+	}
+	return env, nil
+}
 
 // transitionEnv is the atomic hop shared by every state move: read the
 // persisted state, validate the edge against the domain transition table,
@@ -440,7 +783,8 @@ func (s *PostgresStore) transitionEnv(
 	}
 	tag, err := s.pool.Exec(ctx, `
 UPDATE environments
-SET state = $2, updated_at = now()
+SET state = $2, updated_at = now(),
+    metadata = `+timelineSQL+`
 WHERE id = $1 AND state = $3`, environmentID, string(target), string(current))
 	if err != nil {
 		return fmt.Errorf("store: transition environment %s to %s: %w", environmentID, target, err)
@@ -689,7 +1033,10 @@ WHERE id = $1 AND lease_owner = $2 AND state = 'running'`, stepID, owner)
 
 	tag, err = tx.Exec(ctx, `
 UPDATE environments
-SET state = 'ready', updated_at = now()
+SET state = 'ready', updated_at = now(),
+    metadata = jsonb_set(metadata, '{timeline}',
+        COALESCE(metadata->'timeline', '[]'::jsonb) || jsonb_build_array(
+            jsonb_build_object('state', 'ready', 'at', now())))
 WHERE id = $1 AND state = 'verifying'`, environmentID)
 	if err != nil {
 		return fmt.Errorf("store: complete verification of environment %s: %w", environmentID, err)
@@ -767,7 +1114,11 @@ WHERE environment_id = $1 AND kind = $3`,
 	}
 
 	tag, err := tx.Exec(ctx, `
-UPDATE environments SET state = 'ready', updated_at = now()
+UPDATE environments
+SET state = 'ready', updated_at = now(),
+    metadata = jsonb_set(metadata, '{timeline}',
+        COALESCE(metadata->'timeline', '[]'::jsonb) || jsonb_build_array(
+            jsonb_build_object('state', 'ready', 'at', now())))
 WHERE id = $1 AND state = 'rotating'`, environmentID)
 	if err != nil {
 		return fmt.Errorf("store: complete rotation of environment %s: %w", environmentID, err)
