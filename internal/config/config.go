@@ -19,7 +19,12 @@ type Config struct {
 	VaultAddr string
 	// VaultToken authenticates to Vault. In dev this is the root token.
 	VaultToken string
-	// OTLPEndpoint receives OpenTelemetry traces and metrics.
+	// OTLPEndpoint receives OpenTelemetry traces and metrics. Empty means no
+	// collector is configured: the trace and metric providers degrade to
+	// no-ops, so the service runs (and provisions) at full speed with no
+	// collector listening anywhere. Default: unset — run with the
+	// docker-compose collector by exporting
+	// OTEL_EXPORTER_OTLP_ENDPOINT=localhost:4317.
 	OTLPEndpoint string
 	// WorkerConcurrency is how many provisioning steps may run at once.
 	WorkerConcurrency int
@@ -49,7 +54,7 @@ func Load() (Config, error) {
 		DatabaseURL:            env("DATABASE_URL", "postgres://orchestrator:orchestrator@localhost:5432/orchestrator?sslmode=disable"),
 		VaultAddr:              env("VAULT_ADDR", "http://localhost:8200"),
 		VaultToken:             env("VAULT_TOKEN", "root"),
-		OTLPEndpoint:           env("OTEL_EXPORTER_OTLP_ENDPOINT", "localhost:4317"),
+		OTLPEndpoint:           env("OTEL_EXPORTER_OTLP_ENDPOINT", ""),
 		WorkerConcurrency:      4,
 		StepTimeout:            30 * time.Second,
 		LeaseDuration:          90 * time.Second,

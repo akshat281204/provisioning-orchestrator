@@ -169,6 +169,25 @@ const stepColumns = `id, environment_id, step_index, kind, state, attempts,
 
 // scanStepInto scans one workflow_steps row into a domain.Step.
 func scanStepInto(row pgx.Row) (domain.Step, error) {
+	return scanStepReclaim(row, nil)
+}
+
+// scanClaimedStep scans a ClaimNextStep row: stepColumns plus one trailing
+// column, the pre-claim `was_running` flag, which it reports as the step's
+// Reclaimed signature.
+func scanClaimedStep(row pgx.Row) (domain.Step, error) {
+	var reclaimed bool
+	st, err := scanStepReclaim(row, &reclaimed)
+	if err != nil {
+		return domain.Step{}, err
+	}
+	st.Reclaimed = reclaimed
+	return st, nil
+}
+
+// scanStepReclaim scans one workflow_steps row in stepColumns order; when
+// reclaimed is non-nil the row carries one extra trailing boolean column.
+func scanStepReclaim(row pgx.Row, reclaimed *bool) (domain.Step, error) {
 	var (
 		st       domain.Step
 		idx      int
@@ -181,9 +200,13 @@ func scanStepInto(row pgx.Row) (domain.Step, error) {
 		crAt     time.Time
 		upAt     time.Time
 	)
-	if err := row.Scan(&st.ID, &st.EnvironmentID, &idx, &kind, &state, &attempts,
+	dests := []any{&st.ID, &st.EnvironmentID, &idx, &kind, &state, &attempts,
 		&st.LeaseOwner, &leaseExp, &st.OperationKey, &asset,
-		&st.LastError, &crAt, &upAt); err != nil {
+		&st.LastError, &crAt, &upAt}
+	if reclaimed != nil {
+		dests = append(dests, reclaimed)
+	}
+	if err := row.Scan(dests...); err != nil {
 		return domain.Step{}, err
 	}
 	st.StepIndex = idx
@@ -252,9 +275,11 @@ var cleanupFilterWhere = "kind IN " + cleanupKindWhere
 // running with an expired lease) for owner in one statement: the CTE locks
 // the first candidate row FOR UPDATE so concurrent claimers skip past it
 // (SKIP LOCKED — no worker can claim the same live step), and the UPDATE
-// advances it to running under owner before returning the row. `in_doubt`
-// steps are structurally unclaimable here — a pending row with a floating
-// backoff lease is also skipped until its delay elapses.
+// advances it to running under owner before returning the row, along with
+// whether its pre-claim state was `running` (a reclaim off a dead owner's
+// expired lease). `in_doubt` steps are structurally unclaimable here — a
+// pending row with a floating backoff lease is also skipped until its delay
+// elapses.
 func (s *PostgresStore) ClaimNextStep(ctx context.Context, owner string, lease time.Duration) (domain.Step, error) {
 	if lease <= 0 {
 		return domain.Step{}, fmt.Errorf("store: claim next step for %s: lease must be positive", owner)
@@ -262,7 +287,7 @@ func (s *PostgresStore) ClaimNextStep(ctx context.Context, owner string, lease t
 	where := fmt.Sprintf(claimableWhere, cleanupKindWhere)
 	row := s.pool.QueryRow(ctx, `
 WITH claimable AS (
-    SELECT ws.id
+    SELECT ws.id AS id, (ws.state = 'running') AS was_running
     FROM workflow_steps ws
     JOIN environments e ON e.id = ws.environment_id
     WHERE `+where+`
@@ -278,11 +303,13 @@ SET state            = 'running',
     updated_at       = now()
 FROM claimable c
 WHERE ws.id = c.id
+-- Explicit ws. prefixes below: the CTE's own id column would leave bare
+-- column names ambiguous here.
 RETURNING ws.id, ws.environment_id, ws.step_index, ws.kind, ws.state, ws.attempts,
        COALESCE(ws.lease_owner, ''), ws.lease_expires_at,
        COALESCE(ws.operation_key, ''), ws.metadata, COALESCE(ws.last_error, ''),
-       ws.created_at, ws.updated_at`, owner, lease.Seconds())
-	step, err := scanStepInto(row)
+       ws.created_at, ws.updated_at, c.was_running`, owner, lease.Seconds())
+	step, err := scanClaimedStep(row)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return domain.Step{}, fmt.Errorf("store: claim next step: %w", ErrNoWork)
@@ -1465,4 +1492,34 @@ WHERE id = $1 AND state = 'rotating'`, environmentID)
 		return fmt.Errorf("store: complete rotation for %s: commit: %w", environmentID, err)
 	}
 	return nil
+}
+
+// SetStepsTraceparent merges the W3C trace context (phase 8) into every
+// step's metadata of one environment. It is called once, right after the
+// environment and its plan are created, so any worker — this one or one that
+// resumes after a crash — can join the step to the trace that created it.
+// Trace context in the rows, not in process memory, is what makes the trace
+// survive a restart.
+func (s *PostgresStore) SetStepsTraceparent(ctx context.Context, environmentID, traceparent string) error {
+	_, err := s.pool.Exec(ctx, `
+UPDATE workflow_steps
+SET metadata = jsonb_set(metadata, '{traceparent}', to_jsonb($2::text))
+WHERE environment_id = $1`, environmentID, traceparent)
+	if err != nil {
+		return fmt.Errorf("store: set traceparent for the steps of %s: %w", environmentID, err)
+	}
+	return nil
+}
+
+// CountStepsInDoubt is the steps_in_doubt gauge's source of truth: a periodic
+// count over the rows, so the metric stays honest across restarts instead of
+// drifting with what one process happens to have seen this run.
+func (s *PostgresStore) CountStepsInDoubt(ctx context.Context) (int64, error) {
+	var n int64
+	if err := s.pool.QueryRow(ctx, `
+SELECT count(*) FROM workflow_steps WHERE state = $1`,
+		string(domain.StepInDoubt)).Scan(&n); err != nil {
+		return 0, fmt.Errorf("store: count in_doubt steps: %w", err)
+	}
+	return n, nil
 }

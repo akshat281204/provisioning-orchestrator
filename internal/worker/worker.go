@@ -20,6 +20,7 @@ import (
 	"github.com/akshat281204/provisioning-orchestrator/internal/adapters"
 	"github.com/akshat281204/provisioning-orchestrator/internal/domain"
 	"github.com/akshat281204/provisioning-orchestrator/internal/store"
+	"github.com/akshat281204/provisioning-orchestrator/internal/telemetry"
 )
 
 // Store is the coordination surface the pool needs. *store.PostgresStore
@@ -111,6 +112,10 @@ type Pool struct {
 	// backoff with jitter, capped attempts. Zero MaxAttempts disables
 	// scheduling (the failure is recorded and stays failed).
 	RetryPolicy RetryPolicy
+	// Tele publishes the phase-8 metrics for the pool's events: attempts,
+	// lease expirations, reconciliation verdicts, in_doubt counts, and the
+	// provisioning/cleanup duration series. nil disables all of them.
+	Tele *telemetry.Metrics
 	// Log is optional; a discard logger is used when nil.
 	Log *slog.Logger
 }
@@ -327,8 +332,25 @@ func isNoWork(err error) bool {
 // a heartbeat keeping the lease alive, and the outcome recorded. It returns
 // false only when the pool is shutting down and the worker should exit.
 func (p *Pool) execute(ctx context.Context, log *slog.Logger, owner string, step domain.Step) bool {
-	execCtx, cancel := context.WithTimeout(ctx, p.StepTimeout)
+	// Phase 8: a claimed step whose row was still `running` before the
+	// claim was reclaimed off an owner whose lease expired — the
+	// observable signature of a dead worker. The claim returns the
+	// pre-claim state as the step's Reclaimed flag, so a routine pending
+	// claim logs nothing there. The attempt span joins the trace carried
+	// in the step's metadata, so a step resumed on another process lands
+	// in the same trace the creation request opened.
+	if step.Reclaimed {
+		p.Tele.IncLeaseExpiration(ctx)
+	}
+	p.Tele.ObserveStepAttempt(ctx, string(step.Kind))
+	spanCtx, span := telemetry.StartStepSpan(
+		ctx, step.Metadata, string(step.Kind), step.StepIndex, step.Attempts)
+	execCtx, cancel := context.WithTimeout(spanCtx, p.StepTimeout)
 	defer cancel()
+	outcome := "unknown"
+	// The closure reads outcome at return time, not capture time, so each
+	// early-exit branch's verdict reaches the span.
+	defer func() { telemetry.EndStepSpan(span, outcome) }()
 
 	stopHeartbeat := p.startHeartbeat(execCtx, owner, step.ID, log)
 	defer stopHeartbeat()
@@ -348,6 +370,7 @@ func (p *Pool) execute(ctx context.Context, log *slog.Logger, owner string, step
 			// leaving it running until the lease expires. The step is
 			// re-executed by the next live claim, as the day the worker
 			// had crashed.
+			outcome = "released"
 			relCtx := context.WithoutCancel(ctx)
 			if err := p.Store.ReleaseStep(relCtx, step.ID, owner); err != nil {
 				log.Warn("worker could not release step on shutdown",
@@ -362,6 +385,7 @@ func (p *Pool) execute(ctx context.Context, log *slog.Logger, owner string, step
 		// pending nor failed. It records in_doubt: the ambiguity is a
 		// durable fact, and only the reconciler may resolve it, against
 		// the real world, never by blind re-execution.
+		outcome = string(domain.StepInDoubt)
 		relCtx := context.WithoutCancel(ctx)
 		// The environment's in_doubt hop is earned only when the ambiguity
 		// itself was durably recorded: if the in_doubt row did not land
@@ -388,8 +412,10 @@ func (p *Pool) execute(ctx context.Context, log *slog.Logger, owner string, step
 	}
 
 	if execErr != nil {
+		outcome = string(domain.StepFailed)
 		_ = p.recordOutcome(ctx, log, owner, step, domain.StepFailed, execErr.Error())
-		p.maybeScheduleRetry(ctx, log, step)
+		scheduled := p.maybeScheduleRetry(ctx, log, step)
+		p.observeStepOutcome(ctx, step, domain.StepFailed, !scheduled, outcomeFromExecute)
 		p.maybeFinalizeCleanup(ctx, log, step)
 		return true
 	}
@@ -408,10 +434,14 @@ func (p *Pool) execute(ctx context.Context, log *slog.Logger, owner string, step
 		default:
 			log.Info("worker recorded verification; environment ready",
 				"step_id", step.ID, "step_index", step.StepIndex, "environment_id", step.EnvironmentID)
+			outcome = string(domain.StepDone)
+			p.observeStepOutcome(ctx, step, domain.StepDone, true, outcomeFromExecute)
 		}
 		return true
 	}
+	outcome = string(domain.StepDone)
 	_ = p.recordOutcome(ctx, log, owner, step, domain.StepDone, "")
+	p.observeStepOutcome(ctx, step, domain.StepDone, true, outcomeFromExecute)
 	p.maybeFinalizeCleanup(ctx, log, step)
 	return true
 }

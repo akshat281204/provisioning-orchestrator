@@ -24,6 +24,22 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Telemetry is the last thing to leave: shutdown flushes any queued
+	// spans/metric batches to the collector. With no collector configured
+	// the providers are no-ops and this is a free call.
+	shutdown, err := telemetry.Setup(cfg.OTLPEndpoint)
+	if err != nil {
+		log.Error("failed to start telemetry", "err", err)
+		os.Exit(1)
+	}
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), telemetry.ShutdownTimeout)
+		defer cancel()
+		if err := shutdown(ctx); err != nil {
+			log.Warn("telemetry shutdown incomplete", "err", err)
+		}
+	}()
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 

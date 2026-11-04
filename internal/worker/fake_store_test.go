@@ -102,6 +102,7 @@ func (f *fakeStore) ClaimNextStep(_ context.Context, owner string, lease time.Du
 		return domain.Step{}, fmt.Errorf("fake store: %w", store.ErrNoWork)
 	}
 	s := f.steps[idx]
+	s.Reclaimed = s.State == domain.StepRunning // pre-claim running ⇒ expired lease
 	s.State = domain.StepRunning
 	s.LeaseOwner = owner
 	s.Attempts++

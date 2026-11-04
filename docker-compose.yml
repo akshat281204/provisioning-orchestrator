@@ -51,5 +51,18 @@ services:
     ports:
       - "9090:9090"
 
+  # The phase-8 dashboard: provisioned from deploy/ with no manual import.
+  grafana:
+    image: grafana/grafana:11.3.0
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    volumes:
+      - ./deploy/dashboard.json:/var/lib/grafana/dashboards/dashboard.json:ro
+      - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
+    ports:
+      - "3000:3000"
+
 volumes:
   pgdata:

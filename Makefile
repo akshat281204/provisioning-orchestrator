@@ -65,6 +65,10 @@ down: ## Stop the local stack
 migrate: ## Apply embedded SQL migrations to the configured database
 	$(GO) run ./cmd/migrate
 
+.PHONY: demo
+demo: ## Run the end-to-end failure-recovery demo (see scripts/failure-recovery-demo.sh)
+	bash scripts/failure-recovery-demo.sh
+
 .PHONY: logs
 logs: ## Tail the local stack
 	docker compose logs -f --tail=100
