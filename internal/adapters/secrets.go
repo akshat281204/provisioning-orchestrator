@@ -21,9 +21,13 @@ type Secrets interface {
 	Delete(ctx context.Context, envID string) error
 }
 
-// ErrSecretNotFound is returned by Get (and wraps any backend miss); callers
-// branch on it to decide whether credentials still need writing.
-var ErrSecretNotFound = errors.New("adapters: secret not found")
+// ErrSecretNotFound and ErrSecretMalformed distinguish a missing path from a
+// present path whose document cannot be used. Reconciliation must never call
+// malformed data "absent" and skip its cleanup.
+var (
+	ErrSecretNotFound  = errors.New("adapters: secret not found")
+	ErrSecretMalformed = errors.New("adapters: malformed secret document")
+)
 
 // VaultSecrets is the local Secrets implementation: one KV-v2 path per
 // environment, values written as a JSON document under `payload`. The
@@ -102,18 +106,20 @@ func (s *VaultSecrets) Get(ctx context.Context, envID string) (map[string]string
 			return nil, fmt.Errorf("adapters: get secret for %s: %w", envID, ErrSecretNotFound)
 		}
 		return nil, fmt.Errorf("adapters: get secret for %s: %w", envID, err)
-	case secret == nil || secret.Data == nil:
+	case secret == nil:
 		return nil, fmt.Errorf("adapters: get secret for %s: %w", envID, ErrSecretNotFound)
+	case secret.Data == nil:
+		return nil, fmt.Errorf("adapters: get secret for %s: %w", envID, ErrSecretMalformed)
 	}
 	raw, ok := secret.Data["payload"].(map[string]any)
 	if !ok {
-		return nil, fmt.Errorf("adapters: get secret for %s: unexpected document shape %w", envID, ErrSecretNotFound)
+		return nil, fmt.Errorf("adapters: get secret for %s: unexpected document shape: %w", envID, ErrSecretMalformed)
 	}
 	out := make(map[string]string, len(raw))
 	for k, v := range raw {
 		str, isStr := v.(string)
 		if !isStr {
-			return nil, fmt.Errorf("adapters: get secret for %s: key %q is %T: %w", envID, k, v, ErrSecretNotFound)
+			return nil, fmt.Errorf("adapters: get secret for %s: key %q is %T: %w", envID, k, v, ErrSecretMalformed)
 		}
 		out[k] = str
 	}

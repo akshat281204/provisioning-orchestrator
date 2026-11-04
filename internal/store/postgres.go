@@ -241,9 +241,6 @@ const claimableWhere = `((ws.state = 'pending'
 // forwardInFlightFilterWhere counts forward (non-cleanup) rows that are not
 // yet resolved: the work a cancel/delete must wait for before its cleanup
 // plan may run or the workflow may close.
-// forwardInFlightFilterWhere counts forward (non-cleanup) rows that are not
-// yet resolved: the work a cancel/delete must wait for before its cleanup
-// plan may run or the workflow may close.
 var forwardInFlightFilterWhere = "kind NOT IN " + cleanupKindWhere + `
     AND state IN ('running', 'in_doubt')`
 
@@ -552,6 +549,12 @@ const inDoubtLease = 60 * time.Second
 // running→in_doubt / in_doubt→in_doubt is the no-verdict rewrite. A row not
 // held by owner wraps ErrNotFound — the claim was lost, so this owner's
 // verdict is void.
+//
+// The statement is transactional with the environment's resume: for any
+// verdict other than in_doubt, the environment's move out of its in_doubt
+// state commits with the verdict, so a crash can never leave the
+// environment stranded in_doubt over a step that already carries its final
+// verdict — no follow-up statement, and thus no crash gap between them.
 func (s *PostgresStore) RecordReconcileOutcome(
 	ctx context.Context, stepID, owner string, state domain.StepState, lastErr string,
 ) error {
@@ -560,20 +563,111 @@ func (s *PostgresStore) RecordReconcileOutcome(
 	default:
 		return fmt.Errorf("store: record reconcile outcome %s: illegal outcome state %q", stepID, state)
 	}
-	tag, err := s.pool.Exec(ctx, `
+	clearLease := state != domain.StepInDoubt
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("store: record reconcile outcome %s: begin: %w", stepID, err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	// The verdict lands first and reads back the fields that route the
+	// environment resume — a lost lease (the row did not stay held) voids
+	// the verdict before any environment move is even considered.
+	var (
+		envID     string
+		stepIndex int
+	)
+	row := tx.QueryRow(ctx, `
 UPDATE workflow_steps
 SET state            = $2,
-    last_error       = $3,
-    lease_owner      = NULL,
-    lease_expires_at = NULL,
-    updated_at       = now()
-WHERE id = $1 AND lease_owner = $4 AND (state = 'in_doubt' OR state = 'running')`,
-		stepID, string(state), lastErr, owner)
-	if err != nil {
+    last_error       = $3`+leaseClearSQL(clearLease)+`
+WHERE id = $1 AND lease_owner = $4 AND (state = 'in_doubt' OR state = 'running')
+RETURNING environment_id, step_index`, stepID, string(state), lastErr, owner)
+	if err := row.Scan(&envID, &stepIndex); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return fmt.Errorf("store: record reconcile outcome %s as %s (owner %s): %w",
+				stepID, state, owner, ErrNotFound)
+		}
 		return fmt.Errorf("store: record reconcile outcome %s as %s: %w", stepID, state, err)
 	}
+	if clearLease {
+		// The verdict and the environment's resume are ONE commit: dying
+		// between them is no longer expressible, so the in_doubt state can
+		// never outlive a step that already carries a final verdict.
+		if err := resumeEnvironmentTx(ctx, tx, envID, stepIndex); err != nil {
+			return fmt.Errorf("store: record reconcile outcome %s: resume %s: %w", stepID, envID, err)
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("store: record reconcile outcome %s as %s: commit: %w", stepID, state, err)
+	}
+	return nil
+}
+
+// leaseClearSQL is the lease-clearing fragment of the reconcile verdict: an
+// unobservation (in_doubt) keeps the reconciliation lease — clearing it
+// would let the same pass immediately reclaim and hot-loop against an
+// unavailable dependency, and the expiry reaper makes the row eligible
+// later; a real verdict clears it, the ambiguity is over.
+func leaseClearSQL(clear bool) string {
+	if clear {
+		return `,
+    lease_owner      = NULL,
+    lease_expires_at = NULL,
+    updated_at       = now()`
+	}
+	return `,
+    updated_at       = now()`
+}
+
+// resumeEnvironmentTx moves an in_doubt environment back into its workflow
+// once its ambiguous step was reconciled: steps before the verify index go
+// to provisioning, the verify step itself to verifying. It runs inside the
+// verdict's transaction; any other current state passes through unchanged,
+// and an illegal edge (a concurrent move won) is a logged no-op upstream.
+func resumeEnvironmentTx(ctx context.Context, tx pgx.Tx, environmentID string, stepIndex int) error {
+	var state string
+	if err := tx.QueryRow(ctx,
+		`SELECT state FROM environments WHERE id = $1 FOR UPDATE`, environmentID).Scan(&state); err != nil {
+		return fmt.Errorf("store: read state of %s: %w", environmentID,
+			mapError(fmt.Sprintf("store: read state of %s", environmentID), err))
+	}
+	current := domain.EnvState(state)
+	if current != domain.EnvInDoubt {
+		return nil
+	}
+	// An environment with cleanup rows is owned by the cleanup finalizer,
+	// not by the forward workflow: delete/cancel was requested, so resuming
+	// provisioning here would resurrect scheduling the cancellation stopped
+	// (claimableWhere freezes forward kinds exactly for that reason). The
+	// finalizer closes the environment once the compensation plan concludes.
+	var n int
+	if err := tx.QueryRow(ctx, `
+SELECT count(*) FROM workflow_steps
+WHERE environment_id = $1 AND `+cleanupFilterWhere, environmentID).Scan(&n); err != nil {
+		return fmt.Errorf("store: read cleanup rows of %s: %w", environmentID, err)
+	}
+	if n > 0 {
+		return nil
+	}
+	target := domain.EnvProvisioning
+	if stepIndex >= verifyStepIndex {
+		target = domain.EnvVerifying
+	}
+	if !domain.CanTransition(current, target) {
+		return nil
+	}
+	tag, err := tx.Exec(ctx, `
+UPDATE environments
+SET state = $2, updated_at = now(),
+    metadata = `+timelineSQL+`
+WHERE id = $1 AND state = $3`, environmentID, string(target), string(current))
+	if err != nil {
+		return fmt.Errorf("store: transition environment %s to %s: %w", environmentID, target, err)
+	}
 	if tag.RowsAffected() == 0 {
-		return fmt.Errorf("store: record reconcile outcome %s as %s (owner %s): %w", stepID, state, owner, ErrNotFound)
+		return fmt.Errorf("store: transition environment %s to %s: state moved while transitioning",
+			environmentID, target)
 	}
 	return nil
 }
@@ -694,38 +788,30 @@ WHERE id = $1 AND state = 'failed'`, stepID, delay.Seconds())
 }
 
 // MarkEnvironmentInDoubt CAS-moves the environment to in_doubt after one of
-// its steps recorded an unknown outcome. A state with no legal in_doubt edge
-// is passed through silently: the step row already carries the ambiguity,
-// and inventing an illegal environment move would corrupt the machine.
+// its steps recorded an unknown outcome. The move is GATED on an actually
+// ambiguous row: the UPDATE only matches while the environment still carries
+// a workflow_steps row in `in_doubt`, so the environment can never be moved
+// to in_doubt over a step whose ambiguity already resolved (whose record
+// failed to land, or whose lease was lost to a reclaiming worker) — such an
+// in_doubt environment would never be resumed, because the environment
+// resume commits only with a step verdict. Zero rows changed by this race is
+// a silent success: the step was resolved, its own transaction already
+// resumed (or honestly never moved) the environment.
+//
+// A state with no legal in_doubt edge is passed through silently: the step
+// row already carries the ambiguity, and inventing an illegal environment
+// move would corrupt the machine.
 func (s *PostgresStore) MarkEnvironmentInDoubt(ctx context.Context, environmentID string) error {
 	state, err := s.envStateFor(ctx, environmentID)
 	if err != nil {
 		return err
 	}
-	if !domain.CanTransition(state, domain.EnvInDoubt) {
+	// Cleanup intent owns the environment once cancellation/deletion starts.
+	// Keep that state visible so cleanup claims and finalization can proceed;
+	// the ambiguous forward row still records the unknown outcome by itself.
+	if state == domain.EnvCancelling || state == domain.EnvDeleting {
 		return nil
 	}
-	return s.transitionEnv(ctx, environmentID, state, domain.EnvInDoubt)
-}
-
-// ResumeFromInDoubt moves an in_doubt environment back into its workflow
-// once the ambiguous step was reconciled: steps before the verify index go
-// to provisioning, the verify step itself to verifying. Any other current
-// state passes through unchanged, and an illegal edge (a concurrent move
-// won) surfaces as a logged no-op upstream.
-func (s *PostgresStore) ResumeFromInDoubt(ctx context.Context, environmentID string, stepIndex int) error {
-	state, err := s.envStateFor(ctx, environmentID)
-	if err != nil {
-		return err
-	}
-	if state != domain.EnvInDoubt {
-		return nil
-	}
-	// An environment with cleanup rows is owned by the cleanup finalizer,
-	// not by the forward workflow: delete/cancel was requested, so resuming
-	// provisioning here would resurrect scheduling the cancellation stopped
-	// (claimableWhere freezes forward kinds exactly for that reason). The
-	// finalizer closes the environment once the compensation plan concludes.
 	onCleanup, err := s.hasCleanupRows(ctx, environmentID)
 	if err != nil {
 		return err
@@ -733,16 +819,27 @@ func (s *PostgresStore) ResumeFromInDoubt(ctx context.Context, environmentID str
 	if onCleanup {
 		return nil
 	}
-	target := domain.EnvProvisioning
-	if stepIndex >= verifyStepIndex {
-		target = domain.EnvVerifying
-	}
-	if !domain.CanTransition(state, target) {
+	if !domain.CanTransition(state, domain.EnvInDoubt) {
 		return nil
 	}
-	return s.transitionEnv(ctx, environmentID, state, target)
+	tag, err := s.pool.Exec(ctx, `
+UPDATE environments
+SET state = $2, updated_at = now(),
+    metadata = `+timelineSQL+`
+WHERE id = $1 AND state = $3
+  AND EXISTS (SELECT 1 FROM workflow_steps ds
+      WHERE ds.environment_id = environments.id AND ds.state = 'in_doubt')`,
+		environmentID, string(domain.EnvInDoubt), string(state))
+	if err != nil {
+		return fmt.Errorf("store: transition environment %s to %s: %w",
+			environmentID, domain.EnvInDoubt, err)
+	}
+	_ = tag.RowsAffected() // zero is fine: no ambiguous row to earn the move
+	return nil
 }
 
+// verifyStepIndex is derived from the shared plan so reconciliation routing
+// stays correct if setup steps are added or reordered.
 // hasCleanupRows reports whether the environment carries any cleanup-plan
 // rows — the durable marker that a cancellation or deletion was requested.
 func (s *PostgresStore) hasCleanupRows(ctx context.Context, environmentID string) (bool, error) {
@@ -755,8 +852,16 @@ WHERE environment_id = $1 AND `+cleanupFilterWhere, environmentID).Scan(&n); err
 	return n > 0, nil
 }
 
-// verifyStepIndex is the 1-based plan position of the verify_usable step.
-const verifyStepIndex = 6
+// verifyStepIndex is derived from the shared plan so reconciliation routing
+// stays correct if setup steps are added or reordered.
+var verifyStepIndex = func() int {
+	for _, step := range domain.Plan() {
+		if step.Kind == domain.KindVerifyUsable {
+			return step.Index
+		}
+	}
+	return len(domain.Plan()) + 1
+}()
 
 // BeginCleanup moves the environment to cancelling or deleting and makes
 // sure the compensation steps exist, in one transaction: the plan rows land
@@ -910,13 +1015,16 @@ WHERE environment_id = $1 AND `+cleanupFilterWhere, environmentID).Scan(&doneCou
 	if err != nil {
 		return fmt.Errorf("store: finalize cleanup %s: %w", environmentID, err)
 	}
-	// There must be a full cleanup plan; an orphan without one has nothing
-	// to wait for and is finalized as if it were done.
-	if doneCount+failedCount < len(domain.CleanupPlan) {
-		_ = tx.Rollback(ctx)
-		return nil
-	}
-
+	// The failure verdict must NOT wait for the whole plan: a cleanup step
+	// that rests failed (exhausted retries, or a failed-to-reschedule
+	// failure) BLOCKS every later cleanup index — the row behind it can
+	// never be claimed while its predecessor is not done — so waiting for a
+	// full set of verdicts would strand the environment `deleting` forever.
+	// Workers and the resume sweep only finalize after a failing step had
+	// its chance to be re-scheduled, so a resting failure here is one past
+	// its retry budget (or unrecoverable), which is exactly the failure the
+	// criterion demands be surfaced. The terminal (all-done) verdict is the
+	// only one that still needs every row accounted for.
 	switch {
 	case failedCount > 0:
 		// A cleanup step that keeps failing stays visible as failed and the
@@ -932,7 +1040,20 @@ WHERE id = $1 AND state = $3`,
 			environmentID, string(domain.EnvFailed), string(current)); err != nil {
 			return fmt.Errorf("store: finalize cleanup %s: mark failed: %w", environmentID, err)
 		}
-	case failedCount == 0 && doneCount == len(domain.CleanupPlan):
+	case doneCount == len(domain.CleanupPlan):
+		// There must be a full cleanup plan at verdicts-all-done; an orphan
+		// without one has nothing to wait for and is finalized as if it
+		// were done.
+		var total int
+		if err := tx.QueryRow(ctx, `
+SELECT count(*) FROM workflow_steps
+WHERE environment_id = $1 AND `+cleanupFilterWhere, environmentID).Scan(&total); err != nil {
+			return fmt.Errorf("store: finalize cleanup %s: %w", environmentID, err)
+		}
+		if total != len(domain.CleanupPlan) {
+			_ = tx.Rollback(ctx)
+			return nil
+		}
 		// The failed→deleted path walks the legal edge failed->deleting
 		// first, so the machine is never asked for an illegal move.
 		if current == domain.EnvFailed {

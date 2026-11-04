@@ -125,9 +125,11 @@ func (r *Reconciler) Reconcile(ctx context.Context, step domain.Step) (Reconcile
 			// Exists-and-matches: the payload must name exactly this
 			// environment's database and role. Anything else is a verdict
 			// to fail on — it is not the credential this environment plans.
-			return payloadOutcome(payload)
+			return payloadOutcome(payload, step.EnvironmentID)
 		case errors.Is(err, ErrSecretNotFound):
 			return OutcomePending, nil
+		case errors.Is(err, ErrSecretMalformed):
+			return OutcomeFailed, nil
 		default:
 			return "", fmt.Errorf("reconcile store_credentials (%s): %w", step.ID, err)
 		}
@@ -180,6 +182,8 @@ func (r *Reconciler) Reconcile(ctx context.Context, step domain.Step) (Reconcile
 			// The secret is gone: the drop has provably happened (or was
 			// never needed) and the cleanup step is done.
 			return OutcomeDone, nil
+		case errors.Is(err, ErrSecretMalformed):
+			return OutcomeFailed, nil
 		case err != nil:
 			return "", fmt.Errorf("reconcile delete_secret (%s): %w", step.ID, err)
 		default:
@@ -211,11 +215,15 @@ func heldOutcome(exists bool) ReconcileOutcome {
 // for its environment: every key the workflow later reads must be present.
 // A stored document that cannot serve the plan is exists-but-differs — the
 // one outcome that is a verdict-shaped failure rather than an ambiguity.
-func payloadOutcome(payload map[string]string) (ReconcileOutcome, error) {
+func payloadOutcome(payload map[string]string, environmentID string) (ReconcileOutcome, error) {
 	for _, key := range []string{"database", "username", "password"} {
 		if payload[key] == "" {
 			return OutcomeFailed, nil
 		}
+	}
+	if payload["database"] != DatabaseName(environmentID) ||
+		payload["username"] != RoleName(environmentID) {
+		return OutcomeFailed, nil
 	}
 	return OutcomeDone, nil
 }

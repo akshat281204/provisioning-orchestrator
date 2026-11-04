@@ -46,7 +46,6 @@ type Store interface {
 	ListFailedSteps(ctx context.Context) ([]domain.Step, error)
 	ScheduleRetry(ctx context.Context, stepID string, delay time.Duration) error
 	MarkEnvironmentInDoubt(ctx context.Context, environmentID string) error
-	ResumeFromInDoubt(ctx context.Context, environmentID string, stepIndex int) error
 	FinalizeCleanup(ctx context.Context, environmentID string) error
 }
 
@@ -364,8 +363,17 @@ func (p *Pool) execute(ctx context.Context, log *slog.Logger, owner string, step
 		// durable fact, and only the reconciler may resolve it, against
 		// the real world, never by blind re-execution.
 		relCtx := context.WithoutCancel(ctx)
-		p.recordOutcome(relCtx, log, owner, step, domain.StepInDoubt, "step timed out; outcome unknown")
-		if !isCleanupKind(step.Kind) {
+		// The environment's in_doubt hop is earned only when the ambiguity
+		// itself was durably recorded: if the in_doubt row did not land
+		// (the lease was lost to a reclaiming worker, or the store had a
+		// transient error), an environment marked in_doubt over no
+		// in_doubt step could never be resumed — no verdict would ever
+		// commit the resume. The store's move is additionally gated on an
+		// actually-ambiguous row (store.MarkEnvironmentInDoubt), so a
+		// reconciler that resolves the step in this window makes the move
+		// a no-op either way.
+		recErr := p.recordOutcome(relCtx, log, owner, step, domain.StepInDoubt, "step timed out; outcome unknown")
+		if recErr == nil && !isCleanupKind(step.Kind) {
 			// Cleanup environments keep their honest deleting/cancelling
 			// state: the cleanup finalizer owns them, and inventing an
 			// in_doubt environment hop would hide the cleanup in progress.
@@ -380,7 +388,7 @@ func (p *Pool) execute(ctx context.Context, log *slog.Logger, owner string, step
 	}
 
 	if execErr != nil {
-		p.recordOutcome(ctx, log, owner, step, domain.StepFailed, execErr.Error())
+		_ = p.recordOutcome(ctx, log, owner, step, domain.StepFailed, execErr.Error())
 		p.maybeScheduleRetry(ctx, log, step)
 		p.maybeFinalizeCleanup(ctx, log, step)
 		return true
@@ -403,7 +411,7 @@ func (p *Pool) execute(ctx context.Context, log *slog.Logger, owner string, step
 		}
 		return true
 	}
-	p.recordOutcome(ctx, log, owner, step, domain.StepDone, "")
+	_ = p.recordOutcome(ctx, log, owner, step, domain.StepDone, "")
 	p.maybeFinalizeCleanup(ctx, log, step)
 	return true
 }
@@ -424,7 +432,7 @@ func outcomeUnknown(execErr error, execCtx context.Context) bool {
 // recordOutcome records the step's end state while still holding the lease.
 // A lost lease (store.ErrNotFound) means another worker reclaimed the step
 // mid-flight: that worker will record the outcome, ours is a no-op — log it.
-func (p *Pool) recordOutcome(ctx context.Context, log *slog.Logger, owner string, step domain.Step, state domain.StepState, lastErr string) {
+func (p *Pool) recordOutcome(ctx context.Context, log *slog.Logger, owner string, step domain.Step, state domain.StepState, lastErr string) error {
 	err := p.Store.CompleteStep(ctx, step.ID, owner, state, lastErr)
 	switch {
 	case errors.Is(err, store.ErrNotFound):
@@ -437,4 +445,5 @@ func (p *Pool) recordOutcome(ctx context.Context, log *slog.Logger, owner string
 		log.Info("worker step recorded",
 			"step_id", step.ID, "step_index", step.StepIndex, "state", state)
 	}
+	return err
 }

@@ -32,8 +32,8 @@ type fakeStore struct {
 	retryBackoffs []time.Duration
 	// cleanupEnvIDs seeds ListCleanupEnvironments for sweep tests.
 	cleanupEnvIDs []string
-	// envEvents records MarkEnvironmentInDoubt / ResumeFromInDoubt /
-	// FinalizeCleanup call names per environment, call order preserved.
+	// envEvents records MarkEnvironmentInDoubt / FinalizeCleanup call
+	// names per environment, call order preserved.
 	envEvents []fakeEnvEvent
 }
 
@@ -192,6 +192,9 @@ func (f *fakeStore) ClaimNextInDoubtStep(_ context.Context, owner string) (domai
 // RecordReconcileOutcome records the reconciler's verdict on a held
 // ambiguous row — the state is already recorded as `in_doubt`, so the owner
 // guard is state in (in_doubt) AND lease_owner = owner, mirroring the SQL.
+// For any verdict other than in_doubt the fake also books the environment
+// resume, because the real store's verdict transaction carries it: there is
+// no separate ResumeFromInDoubt call the worker could crash between.
 func (f *fakeStore) RecordReconcileOutcome(_ context.Context, stepID, owner string, state domain.StepState, lastErr string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -204,8 +207,11 @@ func (f *fakeStore) RecordReconcileOutcome(_ context.Context, stepID, owner stri
 		}
 		s.State = state
 		s.LastError = lastErr
-		s.LeaseOwner = ""
-		s.LeaseExpiresAt = ""
+		if state != domain.StepInDoubt {
+			s.LeaseOwner = ""
+			s.LeaseExpiresAt = ""
+			f.envEvents = append(f.envEvents, fakeEnvEvent{s.EnvironmentID, "resume", s.StepIndex})
+		}
 		f.steps[i] = s
 		f.completions = append(f.completions, s)
 		return nil
@@ -278,25 +284,24 @@ func (f *fakeStore) ScheduleRetry(_ context.Context, stepID string, delay time.D
 		s.LeaseExpiresAt = ""
 		f.steps[i] = s
 		f.retryBackoffs = append(f.retryBackoffs, delay)
+		f.envEvents = append(f.envEvents, fakeEnvEvent{s.EnvironmentID, "schedule_retry", 0})
 		return nil
 	}
 	return fmt.Errorf("fake store: schedule retry %s: %w", stepID, store.ErrNotFound)
 }
 
-// MarkEnvironmentInDoubt, ResumeFromInDoubt and FinalizeCleanup are booked
+// MarkEnvironmentInDoubt and FinalizeCleanup are booked as events: the fake
 // as events: the fake has no environment table, so tests assert on the
 // calls the worker made.
 func (f *fakeStore) MarkEnvironmentInDoubt(_ context.Context, environmentID string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	for _, cleanupID := range f.cleanupEnvIDs {
+		if cleanupID == environmentID {
+			return nil // cleanup state owns this environment; do not hide it
+		}
+	}
 	f.envEvents = append(f.envEvents, fakeEnvEvent{environmentID, "in_doubt", 0})
-	return nil
-}
-
-func (f *fakeStore) ResumeFromInDoubt(_ context.Context, environmentID string, stepIndex int) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.envEvents = append(f.envEvents, fakeEnvEvent{environmentID, "resume", stepIndex})
 	return nil
 }
 

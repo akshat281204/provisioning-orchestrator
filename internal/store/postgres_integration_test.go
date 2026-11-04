@@ -896,6 +896,64 @@ SELECT count(*) FROM workflow_steps WHERE environment_id = $1 AND state = 'faile
 	}
 }
 
+// TestFinalizeCleanupFailedEarlyCleanupStepMarksFailedOnRealSQL pins the
+// failure verdict for the stranding case: the FIRST cleanup step (drop_database)
+// exhausts its retries and rests failed while its successors are still
+// pending — the claim predicate forbids them from ever running, so a
+// finalizer that waited for a full plan of verdicts would strand the
+// environment deleting forever. It must move to failed at once, with the
+// failed step visible for an operator.
+func TestFinalizeCleanupFailedEarlyCleanupStepMarksFailedOnRealSQL(t *testing.T) {
+	pool, st := newTestStore(t)
+	migrate(t, pool)
+	truncate(t, pool)
+	ctx := context.Background()
+
+	env := sampleEnv(t)
+	if _, err := st.CreateEnvironmentWithPlan(ctx, env, domain.Plan()); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if _, err := st.BeginCleanup(ctx, env.ID, domain.EnvCancelling); err != nil {
+		t.Fatalf("begin cleanup: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+UPDATE workflow_steps SET state = 'done', lease_owner = NULL, lease_expires_at = NULL
+WHERE environment_id = $1 AND kind NOT IN
+    ('drop_database', 'drop_role', 'delete_secret', 'release_capacity')`, env.ID); err != nil {
+		t.Fatalf("silence forward plan: %v", err)
+	}
+
+	// The cleanup JANITOR fails at its cap: one claim, one failure, and no
+	// further retry is scheduled — the row rests failed.
+	head, err := st.ClaimNextStep(ctx, "cw", time.Minute)
+	if err != nil {
+		t.Fatalf("claim cleanup head: %v", err)
+	}
+	if head.Kind != domain.KindDropDatabase {
+		t.Fatalf("cleanup head = %s, want drop_database", head.Kind)
+	}
+	if err := st.CompleteStep(ctx, head.ID, "cw", domain.StepFailed, "role is in use"); err != nil {
+		t.Fatalf("record the failure: %v", err)
+	}
+
+	// Later cleanup rows are pending-but-unclaimable while the head rests
+	// failed — the stranding condition the finalizer must not wait out.
+	if _, err := st.ClaimNextStep(ctx, "cw", time.Minute); !errors.Is(err, store.ErrNoWork) {
+		t.Fatalf("no sibling cleanup step may claim behind a failed head, got %v", err)
+	}
+
+	if err := st.FinalizeCleanup(ctx, env.ID); err != nil {
+		t.Fatalf("finalize a plan wedged on an early failure: %v", err)
+	}
+	var envState string
+	if err := pool.QueryRow(ctx, `SELECT state FROM environments WHERE id = $1`, env.ID).Scan(&envState); err != nil {
+		t.Fatalf("read env: %v", err)
+	}
+	if envState != string(domain.EnvFailed) {
+		t.Fatalf("env state with an early failed cleanup step = %s, want failed", envState)
+	}
+}
+
 // TestReconciliationClaimSequencedAfterPredecessorOnRealSQL pins the cleanup
 // plan's reverse order against real SQL: with all four cleanup rows pending,
 // only the FIRST index is claimable — a later index becomes claimable only

@@ -110,21 +110,24 @@ type ReconcileStore interface {
 	// expired). The delay is the durable backoff marker, not process state.
 	ScheduleRetry(ctx context.Context, stepID string, delay time.Duration) error
 	// MarkEnvironmentInDoubt moves the environment to in_doubt when one of
-	// its steps resolved to unknown. Illegal edges (the state machine has
-	// no in_doubt successor for the current state) are silently ignored:
-	// the step's own in_doubt state still records the ambiguity.
+	// its steps resolved to unknown AND the ambiguity was durably recorded:
+	// only an actually in_doubt step earns the move — an environment moved
+	// to in_doubt with no in_doubt step could never be resumed. Illegal
+	// edges (the state machine has no in_doubt successor for the current
+	// state) are silently ignored: the step's own in_doubt state still
+	// records the ambiguity.
 	MarkEnvironmentInDoubt(ctx context.Context, environmentID string) error
-	// ResumeFromInDoubt moves an in_doubt environment back to provisioning
-	// (step index < verify) or verifying (the verify step itself) once its
-	// ambiguous step has been reconciled. Non-in_doubt environments pass
-	// through unchanged.
-	ResumeFromInDoubt(ctx context.Context, environmentID string, stepIndex int) error
 	// RecordReconcileOutcome writes the reconciler's verdict for a step the
 	// reconciler still holds on its in_doubt (or borrowed expired) row:
-	// done/failed/pending, or in_doubt again for an unobservable world. It
-	// fails wrapping ErrNotFound when the lease was lost. This — not
-	// CompleteStep — is the reconciler's record path, so an ambiguity is
-	// never resolved by whoever happens to claim a `running` row.
+	// done/failed/pending, or in_doubt again for an unobservable world. The
+	// recording is also the environment's resume: for any verdict other than
+	// in_doubt the environment's move out of in_doubt commits IN THE SAME
+	// TRANSACTION, so a process death between the two events is impossible —
+	// an environment can never be stranded in_doubt over a step that already
+	// carries its verdict. It fails wrapping ErrNotFound when the lease was
+	// lost. This — not CompleteStep — is the reconciler's record path, so an
+	// ambiguity is never resolved by whoever happens to claim a `running`
+	// row.
 	RecordReconcileOutcome(ctx context.Context, stepID, owner string, state domain.StepState, lastErr string) error
 	// ReapExpiredReconciliations clears the leases of abandoned
 	// reconciliation claims (in_doubt rows whose reconciler died or whose

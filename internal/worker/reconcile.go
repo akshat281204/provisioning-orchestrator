@@ -90,25 +90,29 @@ func (p *Pool) reconcilePass(ctx context.Context, log *slog.Logger, owner string
 // derivable, and ScheduleRetry is a no-op on any row not resting failed.
 func (p *Pool) resumeSweep(ctx context.Context, log *slog.Logger) {
 	nctx := context.WithoutCancel(ctx)
-	envIDs, err := p.Store.ListCleanupEnvironments(nctx)
-	switch {
-	case err != nil:
-		log.Warn("worker resume sweep could not list cleanup environments", "err", err)
-	default:
-		for _, envID := range envIDs {
-			if err := p.Store.FinalizeCleanup(nctx, envID); err != nil {
-				log.Error("worker resume sweep could not finalize the cleanup workflow",
-					"environment_id", envID, "err", err)
-			}
-		}
-	}
+	// Reschedule before finalizing: a failure-to-retry crash gap must not
+	// be mistaken for exhausted cleanup and terminalized before its retry
+	// budget is considered. A listing error is logged, not returned: the
+	// retry scheduler and the cleanup finalizer are independent worklists —
+	// failing one must not delay the other's sweep by a full interval.
 	steps, err := p.Store.ListFailedSteps(nctx)
 	if err != nil {
 		log.Warn("worker resume sweep could not list failed steps", "err", err)
+	} else {
+		for _, step := range steps {
+			p.maybeScheduleRetry(nctx, log, step)
+		}
+	}
+	envIDs, err := p.Store.ListCleanupEnvironments(nctx)
+	if err != nil {
+		log.Warn("worker resume sweep could not list cleanup environments", "err", err)
 		return
 	}
-	for _, step := range steps {
-		p.maybeScheduleRetry(nctx, log, step)
+	for _, envID := range envIDs {
+		if err := p.Store.FinalizeCleanup(nctx, envID); err != nil {
+			log.Error("worker resume sweep could not finalize the cleanup workflow",
+				"environment_id", envID, "err", err)
+		}
 	}
 }
 
@@ -158,8 +162,11 @@ func (p *Pool) resolveInDoubt(ctx context.Context, log *slog.Logger, step domain
 // recordReconcileOutcome writes the reconciler's answer on the row the
 // reconciler holds (RecordReconcileOutcome — never the executor's
 // CompleteStep, so a record can only ever land on an ambiguous or borrowed
-// row). Done and failed cleanup steps also ask the finalizer to close the
-// cleanup; the environment resume is asked regardless of state.
+// row). The verdict and the environment's resume out of in_doubt are ONE
+// store transaction — there is no separate resume call left to crash
+// between. Done and failed cleanup steps also ask the finalizer to close
+// the cleanup; the finalizer is recoverable from the resume sweep, so it
+// stays a follow-up call.
 func (p *Pool) recordReconcileOutcome(
 	ctx context.Context, log *slog.Logger, step domain.Step, state domain.StepState, lastErr string,
 ) {
@@ -173,21 +180,8 @@ func (p *Pool) recordReconcileOutcome(
 		log.Error("worker reconciliation could not record the outcome",
 			"step_id", step.ID, "state", state, "err", err)
 	}
-	if err == nil && state != domain.StepInDoubt {
-		p.resumeAfterReconcile(nctx, log, step)
-	}
-}
-
-// resumeAfterReconcile moves the environment out of in_doubt once its
-// ambiguous step has a verdict, and lets the cleanup finalizer look at the
-// compensation plan when the resolved step was a cleanup step.
-func (p *Pool) resumeAfterReconcile(ctx context.Context, log *slog.Logger, step domain.Step) {
-	if err := p.Store.ResumeFromInDoubt(ctx, step.EnvironmentID, step.StepIndex); err != nil {
-		log.Warn("worker reconciliation could not resume the environment",
-			"environment_id", step.EnvironmentID, "err", err)
-	}
-	if isCleanupKind(step.Kind) {
-		p.maybeFinalizeCleanup(ctx, log, step)
+	if err == nil && state != domain.StepInDoubt && isCleanupKind(step.Kind) {
+		p.maybeFinalizeCleanup(nctx, log, step)
 	}
 }
 

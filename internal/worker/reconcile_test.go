@@ -100,7 +100,12 @@ func TestReconcilePassResolvesEveryOutcome(t *testing.T) {
 			ctx, cancel := context.WithCancel(context.Background())
 			done := startPool(ctx, pool)
 
-			got := waitForStepState(t, st, "step-"+tc.name, tc.want)
+			// The verdict is observed in the store's completion LOG, not in
+			// the live row: a pending verdict is immediately reclaimable and
+			// the pool's own worker can claim and re-execute the step before
+			// the test polls the live state, so the live row is no reliable
+			// observation of the reconcile verdict.
+			got := waitRecordedOutcome(t, st, "step-"+tc.name, tc.want)
 			stopPool(t, cancel, done)
 
 			switch tc.outcome {
@@ -133,11 +138,46 @@ func TestReconcilePassResolvesEveryOutcome(t *testing.T) {
 	}
 }
 
-// TestReconcileObservationErrorLeavesStepInDoubt pins the no-guess rule:
-// when the reconciler cannot observe (its error), the step returns to
-// in_doubt — never done, never failed — for a later pass.
-func TestReconcileObservationErrorLeavesStepInDoubt(t *testing.T) {
-	st := newFakeStore(nil, inDoubtStep("unobservable", 1, domain.KindCreateDatabase))
+// waitRecordedOutcome polls the fake store's completion log until step id has
+// a recorded outcome carrying the wanted verdict. The completion log is the
+// durable record of what the store was told; the live row may have moved on
+// by the time the test looks (a pending verdict is reclaimed and re-executed
+// by the pool's own worker within one poll interval), so the log — append-only
+// and race-free to search — is what the assertion must read.
+func waitRecordedOutcome(t *testing.T, st *fakeStore, id string, want domain.StepState) domain.Step {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		st.mu.Lock()
+		for _, s := range st.completions {
+			if s.ID == id && s.State == want {
+				st.mu.Unlock()
+				return s
+			}
+		}
+		st.mu.Unlock()
+		time.Sleep(5 * time.Millisecond)
+	}
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	t.Fatalf("no recorded outcome ever set step %s to %s; completions: %+v", id, want, st.completions)
+	return domain.Step{}
+}
+
+// TestReconcileObservationErrorKeepsLeaseAndRunsResumeSweep pins both the
+// no-guess rule and pass liveness: a failed probe stays leased in_doubt until
+// expiry, while the same pass still schedules retries and finalizes cleanup.
+func TestReconcileObservationErrorKeepsLeaseAndRunsResumeSweep(t *testing.T) {
+	failedCleanup := step("failed-cleanup", 7)
+	failedCleanup.Kind = domain.KindDropDatabase
+	failedCleanup.EnvironmentID = "env-cleanup"
+	failedCleanup.State = domain.StepFailed
+	failedCleanup.Attempts = 1
+	st := newFakeStore(nil,
+		inDoubtStep("unobservable", 1, domain.KindCreateDatabase),
+		failedCleanup,
+	)
+	st.cleanupEnvIDs = []string{"env-cleanup"}
 	rec := &scriptedReconciler{err: errors.New("probe unreachable")}
 	pool := &worker.Pool{
 		LeaseDuration: time.Minute,
@@ -145,6 +185,7 @@ func TestReconcileObservationErrorLeavesStepInDoubt(t *testing.T) {
 		Store:         st,
 		Executor:      worker.NoopExecutor{},
 		Reconciler:    rec,
+		RetryPolicy:   worker.RetryPolicy{MaxAttempts: 3, BaseBackoff: time.Hour},
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := startPool(ctx, pool)
@@ -152,27 +193,50 @@ func TestReconcileObservationErrorLeavesStepInDoubt(t *testing.T) {
 
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		if n := rec.asked(); n >= 2 {
-			break // asked again by the next pass: the ambiguity is durable
+		st.mu.Lock()
+		hasRetry := len(st.retryBackoffs) > 0
+		hasFinalize := false
+		for _, event := range st.envEvents {
+			if event.Event == "finalize" {
+				hasFinalize = true
+			}
 		}
-		time.Sleep(5 * time.Millisecond)
+		st.mu.Unlock()
+		if rec.asked() == 1 && hasRetry && hasFinalize {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
-	if rec.asked() < 2 {
-		t.Fatalf("an unobservable step must be re-asked on later passes, asked %d time(s)", rec.asked())
+	if rec.asked() != 1 {
+		t.Fatalf("a live reconciliation lease must prevent a hot loop, asked %d time(s)", rec.asked())
 	}
-	// Each observation failure must have recorded the ambiguity again (the
-	// step may currently be mid-re-inspection, so the row's live state can
-	// legitimately be running under a later pass).
 	st.mu.Lock()
-	inDoubtCompletions := 0
-	for _, c := range st.completions {
-		if c.State == domain.StepInDoubt {
-			inDoubtCompletions++
+	var unresolved domain.Step
+	for _, s := range st.steps {
+		if s.ID == "unobservable" {
+			unresolved = s
 		}
 	}
+	events := append([]fakeEnvEvent(nil), st.envEvents...)
+	hasRetry := len(st.retryBackoffs) == 1
 	st.mu.Unlock()
-	if inDoubtCompletions < 2 {
-		t.Fatalf("every failed observation must re-record in_doubt, recorded %d time(s)", inDoubtCompletions)
+	if unresolved.State != domain.StepInDoubt || unresolved.LeaseOwner == "" || unresolved.LeaseExpiresAt == "" {
+		t.Fatalf("an unobservable row must remain in_doubt under its live lease: %+v", unresolved)
+	}
+	if !hasRetry {
+		t.Fatal("resume sweep did not schedule the retryable cleanup step")
+	}
+	retryAt, finalizeAt := -1, -1
+	for i, event := range events {
+		if event.Event == "schedule_retry" && retryAt < 0 {
+			retryAt = i
+		}
+		if event.Event == "finalize" && finalizeAt < 0 {
+			finalizeAt = i
+		}
+	}
+	if retryAt < 0 || finalizeAt < 0 || retryAt > finalizeAt {
+		t.Fatalf("resume sweep must schedule retries before finalization, events: %+v", events)
 	}
 }
 

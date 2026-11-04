@@ -74,8 +74,13 @@ func TestReconcileExistsAndMatchesRecordsDone(t *testing.T) {
 			return reconcilerWith(nil, fakeDatabasesProbe{exists: true}, nil, nil)
 		}, domain.KindCreateDatabase},
 		{"store_credentials", func() *Reconciler {
+			envID := wantStep(domain.KindStoreCreds).EnvironmentID
 			return reconcilerWith(nil, nil, nil, fakeSecretsProbe{
-				payload: map[string]string{"database": "db-xyz", "username": "u-xyz", "password": "p"},
+				payload: map[string]string{
+					"database": DatabaseName(envID),
+					"username": RoleName(envID),
+					"password": "p",
+				},
 			})
 		}, domain.KindStoreCreds},
 		{"create_role", func() *Reconciler {
@@ -181,6 +186,31 @@ func TestReconcileExistsButDiffersRecordsFailed(t *testing.T) {
 	}
 	if got != OutcomeFailed {
 		t.Fatalf("outcome = %q, want failed", got)
+	}
+}
+
+func TestReconcileSecretNamesMustMatchEnvironment(t *testing.T) {
+	step := wantStep(domain.KindStoreCreds)
+	r := reconcilerWith(nil, nil, nil, fakeSecretsProbe{
+		payload: map[string]string{"database": "other-db", "username": "other-role", "password": "p"},
+	})
+	got, err := reconcileOne(t, r, step)
+	if err != nil || got != OutcomeFailed {
+		t.Fatalf("mismatched credential payload: outcome=%q err=%v, want failed", got, err)
+	}
+}
+
+func TestReconcileMalformedSecretIsNotTreatedAsAbsent(t *testing.T) {
+	for _, kind := range []domain.StepKind{domain.KindStoreCreds, domain.KindDeleteSecret} {
+		t.Run(string(kind), func(t *testing.T) {
+			r := reconcilerWith(nil, nil, nil, fakeSecretsProbe{
+				err: fmt.Errorf("probe: %w", ErrSecretMalformed),
+			})
+			got, err := reconcileOne(t, r, wantStep(kind))
+			if err != nil || got != OutcomeFailed {
+				t.Fatalf("malformed secret: outcome=%q err=%v, want failed", got, err)
+			}
+		})
 	}
 }
 

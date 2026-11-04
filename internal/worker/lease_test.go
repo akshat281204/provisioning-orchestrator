@@ -371,3 +371,117 @@ func TestStepTimeoutRecordsInDoubt(t *testing.T) {
 	}
 	t.Fatal("the environment must have been marked in_doubt with its step")
 }
+
+func TestForwardTimeoutDuringCleanupDoesNotHideCleanupState(t *testing.T) {
+	forward := step("slow-forward-during-delete", 2)
+	forward.EnvironmentID = "env-cleanup"
+	st := newFakeStore(nil, forward)
+	st.cleanupEnvIDs = []string{"env-cleanup"}
+	pool := &worker.Pool{
+		LeaseDuration: time.Minute,
+		StepTimeout:   100 * time.Millisecond,
+		Store:         st,
+		Executor:      slowExecutor{sleep: 300 * time.Millisecond},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := startPool(ctx, pool)
+
+	got := waitForStepState(t, st, forward.ID, domain.StepInDoubt)
+	if got.EnvironmentID != "env-cleanup" {
+		t.Fatalf("test step lost its cleanup environment: %+v", got)
+	}
+	stopPool(t, cancel, done)
+
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	for _, e := range st.envEvents {
+		if e.EnvironmentID == "env-cleanup" && e.Event == "in_doubt" {
+			t.Fatal("a forward timeout must not move a cleanup-path environment to in_doubt")
+		}
+	}
+}
+
+// lostRecordStore wraps the fake store to make CompleteStep fail the way a
+// lost lease or a transient store error does: the in_doubt record never
+// lands, so the row never becomes ambiguous.
+type lostRecordStore struct {
+	*fakeStore
+	failComplete bool
+}
+
+func (s *lostRecordStore) CompleteStep(
+	ctx context.Context, stepID, owner string, state domain.StepState, lastErr string,
+) error {
+	if s.failComplete {
+		return fmt.Errorf("fake store: complete step %s as %s (owner %s): %w",
+			stepID, state, owner, store.ErrNotFound)
+	}
+	return s.fakeStore.CompleteStep(ctx, stepID, owner, state, lastErr)
+}
+
+// TestLostInDoubtRecordDoesNotStrandEnvironment covers the resumability hole:
+// only an in_doubt that actually got RECORDED earns an in_doubt environment.
+// When the record failed (lease lost to a reclaiming worker, transient store
+// error), an environment marked in_doubt with no in_doubt step would never be
+// resumed — no verdict commits the resume — so the worker must not move it.
+func TestLostInDoubtRecordDoesNotStrandEnvironment(t *testing.T) {
+	t.Run("failed record leaves the environment alone", func(t *testing.T) {
+		slow := step("slow-lost-record", 1)
+		slow.EnvironmentID = "env-lost"
+		st := &lostRecordStore{fakeStore: newFakeStore(nil, slow), failComplete: true}
+		pool := &worker.Pool{
+			LeaseDuration: time.Minute,
+			StepTimeout:   100 * time.Millisecond,
+			Store:         st,
+			Executor:      slowExecutor{sleep: 300 * time.Millisecond},
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		done := startPool(ctx, pool)
+
+		// Past the step timeout and the executor's sleep: the record
+		// attempt happened, and failed.
+		time.Sleep(500 * time.Millisecond)
+		stopPool(t, cancel, done)
+
+		st.mu.Lock()
+		defer st.mu.Unlock()
+		for _, e := range st.envEvents {
+			if e.EnvironmentID == "env-lost" && e.Event == "in_doubt" {
+				t.Fatalf("a failed in_doubt record must not move the environment: %+v", st.envEvents)
+			}
+		}
+	})
+
+	t.Run("recorded in_doubt still moves the environment", func(t *testing.T) {
+		slow := step("slow-recorded-in-doubt", 1)
+		slow.EnvironmentID = "env-kept"
+		st := &lostRecordStore{fakeStore: newFakeStore(nil, slow)}
+		pool := &worker.Pool{
+			LeaseDuration: time.Minute,
+			StepTimeout:   100 * time.Millisecond,
+			Store:         st,
+			Executor:      slowExecutor{sleep: 300 * time.Millisecond},
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		done := startPool(ctx, pool)
+
+		deadline := time.Now().Add(5 * time.Second)
+		found := false
+		for time.Now().Before(deadline) && !found {
+			st.mu.Lock()
+			for _, e := range st.envEvents {
+				if e.EnvironmentID == "env-kept" && e.Event == "in_doubt" {
+					found = true
+				}
+			}
+			st.mu.Unlock()
+			if !found {
+				time.Sleep(10 * time.Millisecond)
+			}
+		}
+		stopPool(t, cancel, done)
+		if !found {
+			t.Fatal("a recorded in_doubt step must still move its environment to in_doubt")
+		}
+	})
+}
