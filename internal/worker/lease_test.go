@@ -334,11 +334,11 @@ func TestIdlePoolPollsBoundedly(t *testing.T) {
 	}
 }
 
-// TestStepTimeoutLeavesStepRunningForReclaim covers the ambiguous path: when
-// the execution context times out (outcome unknown) the worker leaves the
-// step running — neither done nor failed — so the expiry/reclaim machinery
-// (and, in phase 7, ambiguity reconciliation) takes over.
-func TestStepTimeoutLeavesStepRunningForReclaim(t *testing.T) {
+// TestStepTimeoutRecordsInDoubt covers the ambiguous path: when the
+// execution context times out (outcome unknown) the worker records the step
+// as in_doubt — never failed, never pending — clears its lease, and marks
+// the environment in_doubt so only the reconciler may resolve the step.
+func TestStepTimeoutRecordsInDoubt(t *testing.T) {
 	st := newFakeStore(nil, step("slow-step", 1))
 	pool := &worker.Pool{
 		LeaseDuration: time.Minute,
@@ -353,12 +353,21 @@ func TestStepTimeoutLeavesStepRunningForReclaim(t *testing.T) {
 	stopPool(t, cancel, done)
 
 	got := st.snapshot()[0]
-	if got.State != domain.StepRunning {
-		t.Fatalf("a timed-out step must stay running for reclaim, got %s (+%+v)", got.State, got)
+	if got.State != domain.StepInDoubt {
+		t.Fatalf("a timed-out step must be recorded in_doubt, got %s (+%+v)", got.State, got)
+	}
+	if got.LeaseOwner != "" || got.LeaseExpiresAt != "" {
+		t.Fatalf("an in_doubt step carries no lease, got %+v", got)
+	}
+	if got.LastError == "" || got.State == domain.StepFailed || got.State == domain.StepPending {
+		t.Fatalf("in_doubt must not be a verdict: %+v", got)
 	}
 	st.mu.Lock()
 	defer st.mu.Unlock()
-	if len(st.completions) != 0 {
-		t.Fatalf("no outcome may be recorded for an unknown outcome, got %+v", st.completions)
+	for _, e := range st.envEvents {
+		if e.Event == "in_doubt" {
+			return
+		}
 	}
+	t.Fatal("the environment must have been marked in_doubt with its step")
 }

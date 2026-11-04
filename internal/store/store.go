@@ -97,10 +97,12 @@ type LeaseStore interface {
 // and the retry/counterfactual bookkeeping around a failed step.
 type ReconcileStore interface {
 	// ClaimNextInDoubtStep claims the oldest `in_doubt` step for owner,
-	// advancing it to running so its outcome can be reconciled. `in_doubt`
-	// steps are invisible to ClaimNextStep; this is the only claim path
-	// that touches them. It returns an error wrapping ErrNoWork when none
-	// are left.
+	// taking the reconciliation lease on the row WITHOUT changing its
+	// state: the row stays `in_doubt` until an outcome is recorded, so a
+	// claim that dies leaves the ambiguity durable and no lease expiry can
+	// hand the step to an executor. `in_doubt` steps are invisible to
+	// ClaimNextStep; this is the only claim path that touches them. It
+	// returns an error wrapping ErrNoWork when none are left.
 	ClaimNextInDoubtStep(ctx context.Context, owner string) (domain.Step, error)
 	// ScheduleRetry returns a FAILED step to pending with its lease set to
 	// now()+delay, which makes it unclaimable until the backoff elapses
@@ -117,6 +119,25 @@ type ReconcileStore interface {
 	// ambiguous step has been reconciled. Non-in_doubt environments pass
 	// through unchanged.
 	ResumeFromInDoubt(ctx context.Context, environmentID string, stepIndex int) error
+	// RecordReconcileOutcome writes the reconciler's verdict for a step the
+	// reconciler still holds on its in_doubt (or borrowed expired) row:
+	// done/failed/pending, or in_doubt again for an unobservable world. It
+	// fails wrapping ErrNotFound when the lease was lost. This — not
+	// CompleteStep — is the reconciler's record path, so an ambiguity is
+	// never resolved by whoever happens to claim a `running` row.
+	RecordReconcileOutcome(ctx context.Context, stepID, owner string, state domain.StepState, lastErr string) error
+	// ReapExpiredReconciliations clears the leases of abandoned
+	// reconciliation claims (in_doubt rows whose reconciler died or whose
+	// lease expired mid-look), returning them claimable again while the
+	// rows stay in_doubt. It returns the count reaped.
+	ReapExpiredReconciliations(ctx context.Context) (int64, error)
+	// ListCleanupEnvironments returns the ids of every environment on a
+	// cleanup path (cancelling, deleting, failed) that carries cleanup-plan
+	// rows — the resume sweep's in_doubt-style worklist.
+	ListCleanupEnvironments(ctx context.Context) ([]string, error)
+	// ListFailedSteps returns every failed step with a cleared lease, for
+	// the resume sweep to re-schedule under the row's attempt cap.
+	ListFailedSteps(ctx context.Context) ([]domain.Step, error)
 	// FinalizeCleanup inspects a deleting/cancelling/failed environment's
 	// cleanup steps and closes the workflow: every step done → terminal
 	// (deleted or cancelled); any step failed → failed. It is safe to call

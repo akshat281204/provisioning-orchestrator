@@ -544,3 +544,401 @@ func TestRenewLeaseAndCompleteStepGuards(t *testing.T) {
 		t.Fatalf("released step state = %s, want pending", releasedState)
 	}
 }
+
+// TestBeginCleanupIsIdempotentOnRealSQL pins the durable cleanup entry against
+// Postgres: a second DELETE (or a re-arm of a failed cleanup row) must answer
+// with the same environment — no error, no second plan — and re-arm a cleanup
+// step wedged in failed. This is the phase's repeated-202 acceptance path.
+func TestBeginCleanupIsIdempotentOnRealSQL(t *testing.T) {
+	pool, st := newTestStore(t)
+	migrate(t, pool)
+	truncate(t, pool)
+	ctx := context.Background()
+
+	env := sampleEnv(t)
+	if _, err := st.CreateEnvironmentWithPlan(ctx, env, domain.Plan()); err != nil {
+		t.Fatalf("seed env with plan: %v", err)
+	}
+
+	first, err := st.BeginCleanup(ctx, env.ID, domain.EnvDeleting)
+	if err != nil {
+		t.Fatalf("begin cleanup: %v", err)
+	}
+	if first.State != domain.EnvDeleting {
+		t.Fatalf("state after begin cleanup = %s, want deleting", first.State)
+	}
+	steps, err := st.ListForEnvironment(ctx, env.ID)
+	if err != nil {
+		t.Fatalf("list steps: %v", err)
+	}
+	if len(steps) != len(domain.Plan())+len(domain.CleanupPlan) {
+		t.Fatalf("plan rows after begin cleanup = %d, want %d", len(steps),
+			len(domain.Plan())+len(domain.CleanupPlan))
+	}
+
+	// A repeated DELETE is a success and writes nothing.
+	second, err := st.BeginCleanup(ctx, env.ID, domain.EnvDeleting)
+	if err != nil {
+		t.Fatalf("repeated begin cleanup must be idempotent, got %v", err)
+	}
+	if second.ID != env.ID || second.State != domain.EnvDeleting {
+		t.Fatalf("repeated begin cleanup returned (%s, %s)", second.ID, second.State)
+	}
+	count, err := st.ListForEnvironment(ctx, env.ID)
+	if err != nil {
+		t.Fatalf("list steps after repeat: %v", err)
+	}
+	if len(count) != len(steps) {
+		t.Fatalf("repeated begin cleanup wrote extra rows: %d vs %d", len(count), len(steps))
+	}
+
+	// Wedge one cleanup step in failed, then ask again for the delete: the
+	// retry path must re-arm the wedge to pending, not error out.
+	var wedged domain.Step
+	for i := 0; i < len(domain.Plan())+1; i++ {
+		s, err := st.ClaimNextStep(ctx, "w1", time.Minute)
+		if err != nil {
+			t.Fatalf("claim step %d: %v", i+1, err)
+		}
+		if s.StepIndex > len(domain.Plan()) {
+			wedged = s
+			break
+		}
+		if err := st.CompleteStep(ctx, s.ID, "w1", domain.StepDone, ""); err != nil {
+			t.Fatalf("complete forward step %d: %v", s.StepIndex, err)
+		}
+	}
+	if wedged.ID == "" || wedged.StepIndex != len(domain.Plan())+1 {
+		t.Fatalf("expected to claim cleanup step 7 for the wedge scenario, got %+v", wedged)
+	}
+	if err := st.CompleteStep(ctx, wedged.ID, "w1", domain.StepFailed, "drop refused"); err != nil {
+		t.Fatalf("record the wedge: %v", err)
+	}
+	if _, err := st.BeginCleanup(ctx, env.ID, domain.EnvDeleting); err != nil {
+		t.Fatalf("begin cleanup over a failed cleanup row: %v", err)
+	}
+	var reArmed string
+	if err := pool.QueryRow(ctx,
+		`SELECT state FROM workflow_steps WHERE id = $1`, wedged.ID).Scan(&reArmed); err != nil {
+		t.Fatalf("read wedged row: %v", err)
+	}
+	if reArmed != string(domain.StepPending) {
+		t.Fatalf("a failed cleanup row must be re-armed pending, got %s", reArmed)
+	}
+}
+
+// TestReconciliationClaimKeepsAmbiguityOnRealSQL pins the reconciliation
+// claim's honesty guarantees on the real database: the row STAYS in_doubt
+// under the claim's lease (no ordinary claim can ever see it, and a dead
+// reconciler leaves the ambiguity, not a re-executable running row), only
+// the lease holder records the verdict, and the reaper returns abandoned
+// claims to the queue without touching their state.
+func TestReconciliationClaimKeepsAmbiguityOnRealSQL(t *testing.T) {
+	pool, st := newTestStore(t)
+	migrate(t, pool)
+	truncate(t, pool)
+	ctx := context.Background()
+
+	env := sampleEnv(t)
+	if _, err := st.CreateEnvironmentWithPlan(ctx, env, domain.Plan()[:1]); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	claimed, err := st.ClaimNextStep(ctx, "w1", time.Minute)
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if err := st.CompleteStep(ctx, claimed.ID, "w1", domain.StepInDoubt, "step timed out"); err != nil {
+		t.Fatalf("record in_doubt: %v", err)
+	}
+
+	// in_doubt is invisible to the ordinary claim.
+	if _, err := st.ClaimNextStep(ctx, "w2", time.Minute); !errors.Is(err, store.ErrNoWork) {
+		t.Fatalf("an in_doubt row must not be claimable ordinarily, got %v", err)
+	}
+
+	// The reconciliation claim holds it, WITHOUT leaving in_doubt.
+	doubt, err := st.ClaimNextInDoubtStep(ctx, "rec1")
+	if err != nil {
+		t.Fatalf("reconciliation claim: %v", err)
+	}
+	if doubt.ID != claimed.ID || doubt.State != domain.StepInDoubt || doubt.LeaseOwner != "rec1" {
+		t.Fatalf("reconciliation claim must keep the row in_doubt under its lease: %+v", doubt)
+	}
+	if doubt.Attempts != 1 {
+		t.Fatalf("a reconciliation claim must not re-burn an attempt: attempts = %d", doubt.Attempts)
+	}
+
+	// A second reconciler may not steal a live claim, and a non-holder
+	// cannot record a verdict.
+	if _, err := st.ClaimNextInDoubtStep(ctx, "rec2"); !errors.Is(err, store.ErrNoWork) {
+		t.Fatalf("a live reconciliation claim must be held, got %v", err)
+	}
+	if err := st.RecordReconcileOutcome(ctx, doubt.ID, "rec2", domain.StepDone, ""); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("a non-holder's verdict must be ErrNotFound, got %v", err)
+	}
+
+	// The holder records done: the ambiguity resolves and the lease clears.
+	if err := st.RecordReconcileOutcome(ctx, doubt.ID, "rec1", domain.StepDone, ""); err != nil {
+		t.Fatalf("record outcome: %v", err)
+	}
+	var state, owner *string
+	if err := pool.QueryRow(ctx,
+		`SELECT state, lease_owner FROM workflow_steps WHERE id = $1`, claimed.ID).Scan(&state, &owner); err != nil {
+		t.Fatalf("read resolved row: %v", err)
+	}
+	if state == nil || *state != string(domain.StepDone) || owner != nil {
+		t.Fatalf("recorded row = (%v, %v), want done/NULL owner", state, owner)
+	}
+
+	// The reaper returns an abandoned claim to the queue, still in_doubt.
+	env2 := sampleEnv(t)
+	if _, err := st.CreateEnvironmentWithPlan(ctx, env2, domain.Plan()[:1]); err != nil {
+		t.Fatalf("seed env2: %v", err)
+	}
+	c2, err := st.ClaimNextStep(ctx, "w2", time.Minute)
+	if err != nil {
+		t.Fatalf("claim env2: %v", err)
+	}
+	if err := st.CompleteStep(ctx, c2.ID, "w2", domain.StepInDoubt, "step timed out"); err != nil {
+		t.Fatalf("record env2 ambiguity: %v", err)
+	}
+	c3, err := st.ClaimNextInDoubtStep(ctx, "rec3")
+	if err != nil {
+		t.Fatalf("claim env2 ambiguity: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+UPDATE workflow_steps SET lease_expires_at = now() - interval '1 second'
+WHERE id = $1`, c3.ID); err != nil {
+		t.Fatalf("expire the abandoned claim: %v", err)
+	}
+	reaped, err := st.ReapExpiredReconciliations(ctx)
+	if err != nil {
+		t.Fatalf("reap: %v", err)
+	}
+	if reaped != 1 {
+		t.Fatalf("reaped %d rows, want 1", reaped)
+	}
+	var stState, stOwner string
+	if err := pool.QueryRow(ctx,
+		`SELECT state, COALESCE(lease_owner, '') FROM workflow_steps WHERE id = $1`, c3.ID).Scan(&stState, &stOwner); err != nil {
+		t.Fatalf("read reaped row: %v", err)
+	}
+	if stState != string(domain.StepInDoubt) || stOwner != "" {
+		t.Fatalf("reaped row = (%s, %q), want in_doubt with no owner", stState, stOwner)
+	}
+	if _, err := st.ClaimNextInDoubtStep(ctx, "rec5"); err != nil {
+		t.Fatalf("a reaped claim must be claimable again: %v", err)
+	}
+}
+
+// TestCleanupClaimsWaitForForwardWorkAndOrderOnRealSQL pins the cleanup
+// ordering against real SQL: while a forward step of the environment is in
+// flight — live lease, expired lease, or in_doubt — no cleanup step is
+// claimable and the finalizer refuses to close; once the resolve lands, the
+// cleanup plan runs strictly in its recorded order and only then does the
+// environment close as deleted.
+func TestCleanupClaimsWaitForForwardWorkAndOrderOnRealSQL(t *testing.T) {
+	pool, st := newTestStore(t)
+	migrate(t, pool)
+	truncate(t, pool)
+	ctx := context.Background()
+
+	env := sampleEnv(t)
+	if _, err := st.CreateEnvironmentWithPlan(ctx, env, domain.Plan()); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if _, err := st.BeginCleanup(ctx, env.ID, domain.EnvDeleting); err != nil {
+		t.Fatalf("begin cleanup: %v", err)
+	}
+	// Fast-forward the forward plan to a realistic tail: steps 1..5 done,
+	// step 6 (verify_usable) running under a live lease.
+	if _, err := pool.Exec(ctx, `
+UPDATE workflow_steps SET state = 'done', lease_owner = NULL, lease_expires_at = NULL
+WHERE environment_id = $1 AND step_index <= 5`, env.ID); err != nil {
+		t.Fatalf("fast-forward forward plan: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+UPDATE workflow_steps
+SET state = 'running', lease_owner = 'w1',
+    lease_expires_at = now() + interval '10 minutes'
+WHERE environment_id = $1 AND kind = $2`, env.ID, domain.KindVerifyUsable); err != nil {
+		t.Fatalf("set in-flight verify step: %v", err)
+	}
+
+	// In-flight forward work gates cleanup claims.
+	if _, err := st.ClaimNextStep(ctx, "cw", time.Minute); !errors.Is(err, store.ErrNoWork) {
+		t.Fatalf("a live forward step must gate cleanup claims, got %v", err)
+	}
+	// ...and the finalizer must refuse to close while it is unresolved.
+	if err := st.FinalizeCleanup(ctx, env.ID); err != nil {
+		t.Fatalf("finalize with forward work in flight: %v", err)
+	}
+	var envState string
+	if err := pool.QueryRow(ctx, `SELECT state FROM environments WHERE id = $1`, env.ID).Scan(&envState); err != nil {
+		t.Fatalf("read env: %v", err)
+	}
+	if envState != string(domain.EnvDeleting) {
+		t.Fatalf("env state after swept-away finalize = %s, want deleting", envState)
+	}
+
+	// Expire the forward lease: an expired lease must not re-enable an
+	// ordinary claim (blind re-execution) — the row is unknown work.
+	if _, err := pool.Exec(ctx, `
+UPDATE workflow_steps
+SET lease_expires_at = now() - interval '1 second'
+WHERE environment_id = $1 AND kind = $2`, env.ID, domain.KindVerifyUsable); err != nil {
+		t.Fatalf("expire forward lease: %v", err)
+	}
+	if _, err := st.ClaimNextStep(ctx, "cw", time.Minute); !errors.Is(err, store.ErrNoWork) {
+		t.Fatalf("an expired forward step on a cleanup path must stay unclaimable ordinarily, got %v", err)
+	}
+
+	// The reconciler resolves it against the real world; say it landed.
+	resolved, err := st.ClaimNextInDoubtStep(ctx, "rec")
+	if err != nil {
+		t.Fatalf("resolve the expired forward row: %v", err)
+	}
+	if resolved.StepIndex != 6 || resolved.Kind != domain.KindVerifyUsable {
+		t.Fatalf("reconciliation claim picked the wrong row: %+v", resolved)
+	}
+	if err := st.RecordReconcileOutcome(ctx, resolved.ID, "rec", domain.StepDone, ""); err != nil {
+		t.Fatalf("record resolve: %v", err)
+	}
+
+	// Now the cleanup plan claims strictly in recorded order.
+	for i, kind := range domain.CleanupPlan {
+		s, err := st.ClaimNextStep(ctx, "cw", time.Minute)
+		if err != nil {
+			t.Fatalf("claim cleanup step %d (%s): %v", i, kind, err)
+		}
+		if s.Kind != kind || s.StepIndex != len(domain.Plan())+i+1 {
+			t.Fatalf("cleanup claim %d = (%s, %d), want (%s, %d)",
+				i, s.Kind, s.StepIndex, kind, len(domain.Plan())+i+1)
+		}
+		if err := st.CompleteStep(ctx, s.ID, "cw", domain.StepDone, ""); err != nil {
+			t.Fatalf("complete cleanup step %d: %v", i, err)
+		}
+	}
+	if _, err := st.ClaimNextStep(ctx, "cw", time.Minute); !errors.Is(err, store.ErrNoWork) {
+		t.Fatalf("an exhausted cleanup plan must yield no work, got %v", err)
+	}
+	if err := st.FinalizeCleanup(ctx, env.ID); err != nil {
+		t.Fatalf("finalize complete cleanup: %v", err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT state FROM environments WHERE id = $1`, env.ID).Scan(&envState); err != nil {
+		t.Fatalf("read env after close: %v", err)
+	}
+	if envState != string(domain.EnvDeleted) {
+		t.Fatalf("env state after complete cleanup = %s, want deleted", envState)
+	}
+}
+
+// TestFinalizeCleanupReportsFailedNotDeletedOnRealSQL pins the failure
+// verdict: a cleanup step that keeps failing marks the environment failed —
+// never deleted — with the failed step visible for an operator.
+func TestFinalizeCleanupReportsFailedNotDeletedOnRealSQL(t *testing.T) {
+	pool, st := newTestStore(t)
+	migrate(t, pool)
+	truncate(t, pool)
+	ctx := context.Background()
+
+	env := sampleEnv(t)
+	if _, err := st.CreateEnvironmentWithPlan(ctx, env, domain.Plan()); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if _, err := st.BeginCleanup(ctx, env.ID, domain.EnvCancelling); err != nil {
+		t.Fatalf("begin cleanup: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+UPDATE workflow_steps SET state = 'done', lease_owner = NULL, lease_expires_at = NULL
+WHERE environment_id = $1 AND kind NOT IN
+    ('drop_database', 'drop_role', 'delete_secret', 'release_capacity')`, env.ID); err != nil {
+		t.Fatalf("silence forward plan: %v", err)
+	}
+	// Three kinds land, the last wedges failed: every cleanup row then has
+	// a verdict, so the finalizer can close on the failure.
+	for _, kind := range domain.CleanupPlan[:3] {
+		s, err := st.ClaimNextStep(ctx, "cw", time.Minute)
+		if err != nil {
+			t.Fatalf("claim %s: %v", kind, err)
+		}
+		if s.Kind != kind {
+			t.Fatalf("cleanup claim = %s, want %s", s.Kind, kind)
+		}
+		if err := st.CompleteStep(ctx, s.ID, "cw", domain.StepDone, ""); err != nil {
+			t.Fatalf("complete %s: %v", kind, err)
+		}
+	}
+	s, err := st.ClaimNextStep(ctx, "cw", time.Minute)
+	if err != nil {
+		t.Fatalf("claim wedged step: %v", err)
+	}
+	if err := st.CompleteStep(ctx, s.ID, "cw", domain.StepFailed, "capacity race lost"); err != nil {
+		t.Fatalf("record the wedge: %v", err)
+	}
+	if err := st.FinalizeCleanup(ctx, env.ID); err != nil {
+		t.Fatalf("finalize failed cleanup: %v", err)
+	}
+	var envState string
+	if err := pool.QueryRow(ctx, `SELECT state FROM environments WHERE id = $1`, env.ID).Scan(&envState); err != nil {
+		t.Fatalf("read env: %v", err)
+	}
+	if envState != string(domain.EnvFailed) {
+		t.Fatalf("env state with a failed cleanup step = %s, want failed", envState)
+	}
+	var failedKinds int
+	if err := pool.QueryRow(ctx, `
+SELECT count(*) FROM workflow_steps WHERE environment_id = $1 AND state = 'failed'`, env.ID).Scan(&failedKinds); err != nil {
+		t.Fatalf("count failed steps: %v", err)
+	}
+	if failedKinds != 1 {
+		t.Fatalf("the failed cleanup step must stay visible, found %d", failedKinds)
+	}
+}
+
+// TestReconciliationClaimSequencedAfterPredecessorOnRealSQL pins the cleanup
+// plan's reverse order against real SQL: with all four cleanup rows pending,
+// only the FIRST index is claimable — a later index becomes claimable only
+// after its predecessor is done, and a re-armed failed row does not leapfrog.
+func TestCleanupPlanSequencingOnRealSQL(t *testing.T) {
+	pool, st := newTestStore(t)
+	migrate(t, pool)
+	truncate(t, pool)
+	ctx := context.Background()
+
+	env := sampleEnv(t)
+	if _, err := st.CreateEnvironmentWithPlan(ctx, env, domain.Plan()); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if _, err := st.BeginCleanup(ctx, env.ID, domain.EnvDeleting); err != nil {
+		t.Fatalf("begin cleanup: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+UPDATE workflow_steps SET state = 'done', lease_owner = NULL, lease_expires_at = NULL
+WHERE environment_id = $1 AND kind NOT IN
+    ('drop_database', 'drop_role', 'delete_secret', 'release_capacity')`, env.ID); err != nil {
+		t.Fatalf("silence forward plan: %v", err)
+	}
+
+	// Only the first cleanup index may run.
+	first, err := st.ClaimNextStep(ctx, "cw", time.Minute)
+	if err != nil {
+		t.Fatalf("claim cleanup head: %v", err)
+	}
+	if first.Kind != domain.KindDropDatabase {
+		t.Fatalf("cleanup head = %s, want drop_database", first.Kind)
+	}
+	if _, err := st.ClaimNextStep(ctx, "cw", time.Minute); !errors.Is(err, store.ErrNoWork) {
+		t.Fatalf("no sibling cleanup step may claim while the head runs, got %v", err)
+	}
+	if err := st.CompleteStep(ctx, first.ID, "cw", domain.StepDone, ""); err != nil {
+		t.Fatalf("complete head: %v", err)
+	}
+	second, err := st.ClaimNextStep(ctx, "cw", time.Minute)
+	if err != nil {
+		t.Fatalf("claim after head: %v", err)
+	}
+	if second.Kind != domain.KindDropRole {
+		t.Fatalf("cleanup second = %s, want drop_role", second.Kind)
+	}
+}

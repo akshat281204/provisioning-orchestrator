@@ -132,6 +132,22 @@ func (r *Reconciler) Reconcile(ctx context.Context, step domain.Step) (Reconcile
 			return "", fmt.Errorf("reconcile store_credentials (%s): %w", step.ID, err)
 		}
 
+	case domain.KindDropRole:
+		if r.Roles == nil {
+			return "", fmt.Errorf("reconcile drop_role: no role probe (%s)", step.ID)
+		}
+		exists, err := r.Roles.Exists(ctx, RoleName(step.EnvironmentID))
+		if err != nil {
+			return "", fmt.Errorf("reconcile drop_role (%s): %w", step.ID, err)
+		}
+		// Symmetric with drop_database: a still-present role means the drop
+		// has not run (cleanup alone is redoable → pending); a role that is
+		// gone proved the compensation landed (→ done).
+		if exists {
+			return OutcomePending, nil
+		}
+		return OutcomeDone, nil
+
 	case domain.KindCreateRole, domain.KindGrantPrivs:
 		if r.Roles == nil {
 			return "", fmt.Errorf("reconcile %s: no role probe", step.Kind)
@@ -202,12 +218,4 @@ func payloadOutcome(payload map[string]string) (ReconcileOutcome, error) {
 		}
 	}
 	return OutcomeDone, nil
-}
-
-// logger substitutes a discard handler so log calls are nil-safe.
-func (r *Reconciler) logger() *slog.Logger {
-	if r == nil || r.Log == nil {
-		return slog.New(slog.DiscardHandler)
-	}
-	return r.Log
 }
