@@ -18,6 +18,13 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 API_BASE="http://localhost:8080"
+# The compose postgres host port is configurable so the demo still runs when
+# an unrelated process already holds 5432. DATABASE_URL below is exported for
+# both `make migrate` and the orchestrator binary.
+PG_HOST_PORT="${PG_HOST_PORT:-5432}"
+if ! nc -z localhost "$PG_HOST_PORT" 2>/dev/null; then :; else PG_HOST_PORT=15432; fi
+export DATABASE_URL="postgres://orchestrator:orchestrator@localhost:${PG_HOST_PORT}/orchestrator?sslmode=disable"
+export PG_HOST_PORT
 # Short lease/timeout so the demo does not sit through the production 90s lease
 # after the kill. The lease must exceed the step timeout (config.Validate).
 DEMO_STEP_TIMEOUT="3s"
@@ -57,6 +64,9 @@ env_state() {
     sed -n 's/.*"status":"\([^"]*\)".*/\1/p'
 }
 
+# One-off psql against the compose postgres, used for assertions.
+psql_admin() { docker compose exec -T postgres psql -U orchestrator -d orchestrator -Atq "$@"; }
+
 wait_env_ready() { # env_id timeout_seconds
   local id=$1 deadline=$((SECONDS + ${2:-60})) got
   while :; do
@@ -84,6 +94,11 @@ resource_name() { # prefix env_id
   local hash
   hash="$(printf '%s' "$2" | shasum -a 256 | cut -c1-8)"
   echo "${1}_${2:0:28}_${hash}"
+}
+
+metrics_counter() { # metric_name — current summed value of a counter on /metrics
+  curl -fsS "$API_BASE/metrics" 2>/dev/null |
+    awk -v m="$1" '$1 == m || index($1, m"{") == 1 { sum += $2 } END { print sum + 0 }'
 }
 
 start_orchestrator() {
@@ -154,14 +169,56 @@ docker compose exec -T -e PGPASSWORD="$CREDS_PASS" postgres \
 echo "provisioned role $CREDS_USER queried $CREDS_DB successfully"
 
 stepn "4/7 create a second environment, then kill -9 the orchestrator mid-provisioning"
+
+# Start BEFORE the create: docker exec round trips are slower than the whole
+# workflow, so a poll-per-iteration from this script would routinely miss it.
+# A single psql session inside the postgres container polls the row
+# server-side every 10 ms (\watch), streaming to a file. Once it reports a
+# running step with a live owner for the environment being created,
+# SIGKILL lands on an orphanable, in-flight step. A workflow that reaches
+# ready with no observed live lease fails loudly: the kill would prove
+# nothing.
+WATCH_OUT="$(mktemp -t demo-lease-watch)"
+WATCH_PID=""
+WATCH_SQL="SELECT count(*) FROM workflow_steps ws
+JOIN environments e ON e.id = ws.environment_id
+WHERE e.name = 'demo-interrupted' AND e.state NOT IN ('ready', 'failed', 'deleted', 'cancelled', 'rolled_back')
+  AND ws.state = 'running' AND ws.lease_owner <> ''"
+cleanup_watch() {
+  if [[ -n "$WATCH_PID" ]]; then
+    kill "$WATCH_PID" 2>/dev/null || true
+    wait "$WATCH_PID" 2>/dev/null || true
+  fi
+}
+trap 'cleanup_watch; cleanup' EXIT
+( docker compose exec -T postgres psql -U orchestrator -d orchestrator -Atq \
+    >"$WATCH_OUT" 2>/dev/null <<SQL
+$WATCH_SQL
+\watch 0.01
+SQL
+) &
+WATCH_PID=$!
+
 ENV2_ID="$(create_env demo-tenant demo-interrupted "demo-interrupted-e2e-$SECONDS-$$" | str_field environmentId)"
-[[ -n "$ENV2_ID" ]] || fail "environment two was not accepted"
+[[ -n "$ENV2_ID" ]] || { cleanup_watch; fail "environment two was not accepted"; }
 echo "environment two: $ENV2_ID"
-for _ in $(seq 1 100); do
-  [[ "$(env_state "$ENV2_ID")" == "provisioning" ]] && break
-  sleep 0.2
+
+KILLABLE=0
+for _ in $(seq 1 600); do
+  if grep -qvx '0' "$WATCH_OUT" 2>/dev/null; then
+    KILLABLE=1
+    echo "a step of $ENV2_ID now holds a live lease"
+    break
+  fi
+  [[ "$(env_state "$ENV2_ID")" != "ready" ]] || break
+  sleep 0.05
 done
-echo "environment two is mid-provisioning; sending SIGKILL to the orchestrator"
+cleanup_watch
+[[ "$KILLABLE" == "1" ]] ||
+  fail "no step of environment two was observed holding a live lease before it reached ready; killing now proves nothing"
+
+echo "environment two is mid-provisioning with a held lease; sending SIGKILL to the orchestrator"
+LEASES_BEFORE="$(metrics_counter provisioning_lease_expirations_total)"
 kill -9 "$ORCH_PID" 2>/dev/null || true
 wait "$ORCH_PID" 2>/dev/null || true
 ORCH_PID=""
@@ -175,6 +232,13 @@ echo "waiting for the stale lease (≤ ${DEMO_LEASE_DURATION}) to be reclaimed a
 wait_env_ready "$ENV2_ID" 60 || fail "environment two never reached ready after the crash"
 echo "environment two reached ready after restart"
 
+# The recovery is only proven observable if the lease-expiration counter moved:
+# the reclaim that re-executed the orphaned step must be counted.
+LEASES_AFTER="$(metrics_counter provisioning_lease_expirations_total)"
+[[ "${LEASES_AFTER:-0}" -gt "${LEASES_BEFORE:-0}" ]] ||
+  fail "provisioning_lease_expirations_total did not grow after restart (before=$LEASES_BEFORE after=$LEASES_AFTER); the reclaim that recovered the SIGKILL was not counted"
+echo "lease expiration counter grew ($LEASES_BEFORE -> $LEASES_AFTER): the reclaim was counted"
+
 read -r DB2 ROLE2 PASS2 < <(credentials_for "$ENV2_ID" | {
   python3 -c 'import json, sys
 f = json.load(sys.stdin)
@@ -185,7 +249,6 @@ print(f.get("database") or "", f.get("username") or "", f.get("password") or "")
 stepn "6/7 assert exactly one database and one role exist for the interrupted environment"
 DB_EXPECTED="$(resource_name px "$ENV2_ID")"
 ROLE_EXPECTED="$(resource_name pu "$ENV2_ID")"
-psql_admin() { docker compose exec -T postgres psql -U orchestrator -d orchestrator -Atq "$@"; }
 DB_COUNT="$(psql_admin -c "SELECT count(*) FROM pg_database WHERE datname = '$DB_EXPECTED'")"
 ROLE_COUNT="$(psql_admin -c "SELECT count(*) FROM pg_roles WHERE rolname = '$ROLE_EXPECTED'")"
 [[ "$DB_COUNT" == "1" ]] || fail "expected exactly one database named $DB_EXPECTED, found $DB_COUNT"
@@ -206,7 +269,7 @@ Traces and metrics produced by this run:
                     point its OTLP receiver there as well)
   raw metrics       curl http://localhost:8080/metrics
                     provisioning_lease_expirations_total counted the reclaim
-                    that recovered the SIGKILL above
+                    that recovered the SIGKILL above (asserted in step 5/6)
   prometheus        http://localhost:9090
   grafana dashboard deploy/dashboard.json (datasource: Prometheus on :9090)
   runbook           docs/runbook.md

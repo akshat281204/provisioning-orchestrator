@@ -398,7 +398,7 @@ func (s *PostgresStore) CreatePlan(ctx context.Context, environmentID string, st
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	if err := insertPlan(ctx, tx, environmentID, steps); err != nil {
+	if err := insertPlan(ctx, tx, environmentID, steps, ""); err != nil {
 		return err
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -408,14 +408,25 @@ func (s *PostgresStore) CreatePlan(ctx context.Context, environmentID string, st
 }
 
 // insertPlan writes every planned step row on an open transaction. Any
-// (environment_id, step_index) collision maps to ErrDuplicate.
-func insertPlan(ctx context.Context, tx pgx.Tx, environmentID string, steps []domain.PlannedStep) error {
+// (environment_id, step_index) collision maps to ErrDuplicate. When a
+// traceparent is given it is baked into the same INSERT, so the step rows are
+// claimable only once they already carry the trace context (phase 8): a
+// worker that claims one the instant the transaction commits still joins the
+// provisioning trace.
+func insertPlan(
+	ctx context.Context, tx pgx.Tx, environmentID string, steps []domain.PlannedStep,
+	traceparent string,
+) error {
+	var metadata any
+	if traceparent != "" {
+		metadata = map[string]string{"traceparent": traceparent}
+	}
 	for _, step := range steps {
 		opKey := domain.OperationKey(environmentID, step.Index, step.Kind)
 		if _, err := tx.Exec(ctx, `
-INSERT INTO workflow_steps (id, environment_id, step_index, kind, state, operation_key)
-VALUES (gen_random_uuid(), $1, $2, $3, $4, $5)`,
-			environmentID, step.Index, string(step.Kind), string(domain.StepPending), opKey); err != nil {
+INSERT INTO workflow_steps (id, environment_id, step_index, kind, state, operation_key, metadata)
+VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, COALESCE($6, '{}'::jsonb))`,
+			environmentID, step.Index, string(step.Kind), string(domain.StepPending), opKey, metadata); err != nil {
 			return mapError(fmt.Sprintf("store: create plan for %s (step %d)", environmentID, step.Index), err)
 		}
 	}
@@ -427,8 +438,14 @@ VALUES (gen_random_uuid(), $1, $2, $3, $4, $5)`,
 // and never exists with a half-written plan. A (tenant_id, idempotency_key)
 // or (environment_id, step_index) collision returns an error wrapping
 // ErrDuplicate and writes nothing.
+//
+// traceparent, when non-empty, is stamped onto every step row in that same
+// transaction. It must arrive this way, not as a follow-up UPDATE: the rows
+// are claimable the moment this transaction commits, and a claim must never
+// observe a step that does not yet carry its trace context.
 func (s *PostgresStore) CreateEnvironmentWithPlan(
 	ctx context.Context, env domain.Environment, steps []domain.PlannedStep,
+	traceparent string,
 ) (domain.Environment, error) {
 	params, err := envParams(env)
 	if err != nil {
@@ -451,7 +468,7 @@ RETURNING `+envColumns, params...)
 	if err != nil {
 		return domain.Environment{}, mapError(fmt.Sprintf("store: create environment %s with plan", env.ID), err)
 	}
-	if err := insertPlan(ctx, tx, created.ID, steps); err != nil {
+	if err := insertPlan(ctx, tx, created.ID, steps, traceparent); err != nil {
 		return domain.Environment{}, fmt.Errorf("store: create environment %s with plan: %w", env.ID, err)
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -1495,9 +1512,9 @@ WHERE id = $1 AND state = 'rotating'`, environmentID)
 }
 
 // SetStepsTraceparent merges the W3C trace context (phase 8) into every
-// step's metadata of one environment. It is called once, right after the
-// environment and its plan are created, so any worker — this one or one that
-// resumes after a crash — can join the step to the trace that created it.
+// step's metadata of one environment. The plan insert stamps the traceparent
+// atomically with creation, so this is only the backfill path for rows
+// written before that — an ordinary worker never needs it.
 // Trace context in the rows, not in process memory, is what makes the trace
 // survive a restart.
 func (s *PostgresStore) SetStepsTraceparent(ctx context.Context, environmentID, traceparent string) error {

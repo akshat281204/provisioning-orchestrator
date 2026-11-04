@@ -96,7 +96,7 @@ Operationally:
   itself: those steps may have left external state behind, and each one must
   be resolved before its environment can proceed.
 - If the count stays nonzero past one or two reconciliation intervals
-  (default 30s), the reconciler is failing. The most common cause is that
+  (default 15s), the reconciler is failing. The most common cause is that
   the reconciler cannot read the real world (target database or Vault
   unreachable), which shows up as `reconciliations_total{decision="unobservable"}`.
 - Steps whose reconciliation returns `failed` move their environment toward
@@ -109,7 +109,7 @@ Operationally:
 ## Forcing reconciliation
 
 The reconciler is part of the worker pool: it runs at startup and every
-`ReconcileInterval` (default 30s). Each pass claims every in_doubt step whose
+`ReconcileInterval` (default 15s). Each pass claims every in_doubt step whose
 reconciliation lease is free and resolves as many as the real world lets it.
 There is no separate reconciler to restart; any restart of the orchestrator
 forces the startup pass immediately.

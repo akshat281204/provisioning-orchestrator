@@ -412,10 +412,21 @@ func (p *Pool) execute(ctx context.Context, log *slog.Logger, owner string, step
 	}
 
 	if execErr != nil {
-		outcome = string(domain.StepFailed)
-		_ = p.recordOutcome(ctx, log, owner, step, domain.StepFailed, execErr.Error())
-		scheduled := p.maybeScheduleRetry(ctx, log, step)
-		p.observeStepOutcome(ctx, step, domain.StepFailed, !scheduled, outcomeFromExecute)
+		recErr := p.recordOutcome(ctx, log, owner, step, domain.StepFailed, execErr.Error())
+		if recErr == nil {
+			// The executor's verdict landed durably — now (and only now)
+			// the span carries it. While the record is missing, the
+			// workflow's observable state is still "unknown", and the real
+			// claimant's later record owns the terminal metric below.
+			outcome = string(domain.StepFailed)
+		}
+		p.maybeScheduleRetry(ctx, log, step)
+		// `final` is derived from the row's retry eligibility, not from
+		// whether this ScheduleRetry call succeeded: a transient scheduling
+		// error still leaves the resume sweep a later pass to schedule the
+		// retry, so the step is not terminal until the budget is exhausted.
+		final := recErr == nil && !p.retryEligible(step)
+		p.observeStepOutcome(ctx, step, domain.StepFailed, final, outcomeFromExecute)
 		p.maybeFinalizeCleanup(ctx, log, step)
 		return true
 	}
@@ -439,8 +450,14 @@ func (p *Pool) execute(ctx context.Context, log *slog.Logger, owner string, step
 		}
 		return true
 	}
+	recDone := p.recordOutcome(ctx, log, owner, step, domain.StepDone, "")
+	if recDone != nil {
+		// The outcome never landed durably, so no terminal metric fact and
+		// no done-marked span: the span carries "unknown" — the workflow's
+		// real observable state until another claimant records the truth.
+		return true
+	}
 	outcome = string(domain.StepDone)
-	_ = p.recordOutcome(ctx, log, owner, step, domain.StepDone, "")
 	p.observeStepOutcome(ctx, step, domain.StepDone, true, outcomeFromExecute)
 	p.maybeFinalizeCleanup(ctx, log, step)
 	return true

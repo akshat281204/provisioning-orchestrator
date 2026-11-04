@@ -103,6 +103,26 @@ func NewMetrics() *Metrics {
 		m.stepAttempts, m.reconciliations, m.cleanupDuration,
 	)
 
+	// Pre-materialise every allowed series so /metrics exposes each named
+	// family immediately at startup, before the first labelled observation.
+	// The values are the same bounded allowlist boundedLabel enforces.
+	for _, outcome := range []string{OutcomeSuccess, OutcomeFailed} {
+		m.provisioningDuration.WithLabelValues(boundedLabel(outcome))
+		m.cleanupDuration.WithLabelValues(boundedLabel(outcome))
+	}
+	for _, decision := range []string{
+		DecisionDone, DecisionPending, DecisionFailed, DecisionUnobservable,
+	} {
+		m.reconciliations.WithLabelValues(boundedLabel(decision))
+	}
+	for _, kind := range []string{
+		"reserve_capacity", "create_database", "store_credentials",
+		"create_role", "grant_privileges", "verify_usable",
+		"drop_database", "drop_role", "delete_secret", "release_capacity",
+	} {
+		m.stepAttempts.WithLabelValues(boundedLabel(kind))
+	}
+
 	// The OTel side mirrors the same facts; the no-op provider makes these
 	// constructors and calls free when no collector is configured.
 	meter := otelMeter()
@@ -134,11 +154,50 @@ func (m *Metrics) Handler() http.Handler {
 	return promhttp.HandlerFor(m.registry, promhttp.HandlerOpts{})
 }
 
-// boundedLabel is the cardinality guard: it passes through values that come
-// from domain enumerations and is only ever called with arguments from those
-// fixed sets. Keeping every labelled value behind one function makes the
-// no-secrets/no-ids audit (this package's test) meaningful.
-func boundedLabel(v string) string { return v }
+// boundedLabel is the cardinality guard: values from domain enumerations
+// pass through, everything else collapses to the fallback bucket. Keeping
+// every labelled value behind one function makes the no-secrets/no-ids audit
+// (this package's test) meaningful.
+// boundedLabelValues is the allowlist a metric label value may carry: every
+// domain enumeration this service records (step kinds, outcomes, reconcile
+// decisions) plus the fixed HTTP methods of http.method. Anything else — a
+// generated password, an environment id, a free-text error — collapses to the
+// fallback bucket, so cardinality is structurally bounded rather than
+// enforced only at the call sites.
+var boundedLabelValues = map[string]bool{
+	// Step kinds (internal/domain.StepKind), forward and cleanup.
+	"reserve_capacity":  true,
+	"create_database":   true,
+	"store_credentials": true,
+	"create_role":       true,
+	"grant_privileges":  true,
+	"verify_usable":     true,
+	"drop_database":     true,
+	"drop_role":         true,
+	"delete_secret":     true,
+	"release_capacity":  true,
+	// Outcomes and reconcile decisions.
+	"success":      true,
+	"failed":       true,
+	"done":         true,
+	"pending":      true,
+	"unobservable": true,
+	// HTTP methods, for the span's http.method attribute.
+	"GET": true, "HEAD": true, "POST": true, "PUT": true,
+	"PATCH": true, "DELETE": true, "OPTIONS": true,
+	// The fallback bucket itself.
+	"other": true,
+}
+
+// boundedLabelOther is where every non-allowlisted label value lands.
+const boundedLabelOther = "other"
+
+func boundedLabel(v string) string {
+	if boundedLabelValues[v] {
+		return v
+	}
+	return boundedLabelOther
+}
 
 // ObserveStepAttempt records one step execution attempt.
 func (m *Metrics) ObserveStepAttempt(ctx context.Context, kind string) {

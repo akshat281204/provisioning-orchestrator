@@ -153,7 +153,7 @@ func New(ctx context.Context, cfg config.Config, log *slog.Logger) (*App, error)
 
 	// The /v1 surface is served by its own package against the same pool a
 	// worker (later phases) will claim work from.
-	v1 := httpapi.New(newTraceStore(store.NewPostgresStore(pool), log))
+	v1 := httpapi.New(newTraceStore(store.NewPostgresStore(pool)))
 	v1.AttachCredentials(
 		adapters.NewVaultSecrets(vaultClient, "secret"),
 		adapters.NewLocalRoles(pool, cfg.DatabaseURL, log),

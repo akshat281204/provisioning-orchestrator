@@ -28,9 +28,11 @@ const maxBodyBytes = 1 << 20
 // *store.PostgresStore and by the in-memory fake in tests.
 type Store interface {
 	// CreateEnvironmentWithPlan inserts the environment and every planned
-	// step in one transaction, or errors wrapping store.ErrDuplicate.
+	// step in one transaction, stamping traceparent on every step row in the
+	// same commit, or errors wrapping store.ErrDuplicate.
 	CreateEnvironmentWithPlan(
 		ctx context.Context, env domain.Environment, steps []domain.PlannedStep,
+		traceparent string,
 	) (domain.Environment, error)
 	// GetByIdempotencyKey looks up by (tenant, key); a miss is ErrNotFound.
 	GetByIdempotencyKey(ctx context.Context, tenantID, idempotencyKey string) (domain.Environment, error)
@@ -153,7 +155,7 @@ func (a *API) createEnvironment(w http.ResponseWriter, r *http.Request) {
 		IdempotencyKey: key,
 		Spec:           spec,
 	}
-	created, err := a.envs.CreateEnvironmentWithPlan(r.Context(), env, domain.Plan())
+	created, err := a.envs.CreateEnvironmentWithPlan(r.Context(), env, domain.Plan(), "")
 	switch {
 	case err == nil:
 		writeEnv(w, http.StatusAccepted, created, true)

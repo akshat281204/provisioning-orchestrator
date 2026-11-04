@@ -10,6 +10,7 @@ import (
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/propagation"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	sdktracetest "go.opentelemetry.io/otel/sdk/trace/tracetest"
 	"go.opentelemetry.io/otel/trace"
@@ -25,14 +26,19 @@ const (
 	sentinelEnvID    = "0d3ddffa-e989-43d8-8892-d3ddffae989e"
 )
 
-// withRecorder installs a recording tracer provider and returns (recorder, undo).
+// withRecorder installs a recording tracer provider and the W3C propagator,
+// and returns (recorder, undo). The propagator install makes the traceparent
+// join deterministic rather than dependent on the global default.
 func withRecorder(t *testing.T) (*sdktracetest.SpanRecorder, func()) {
 	t.Helper()
 	rec := sdktracetest.NewSpanRecorder()
 	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(rec))
 	prev := otel.GetTracerProvider()
 	otel.SetTracerProvider(tp)
+	prevProp := otel.GetTextMapPropagator()
+	otel.SetTextMapPropagator(propagation.TraceContext{})
 	return rec, func() {
+		otel.SetTextMapPropagator(prevProp)
 		otel.SetTracerProvider(prev)
 		_ = tp.Shutdown(context.Background())
 	}
@@ -79,8 +85,12 @@ func TestSpansExcludeSecretsAndIDs(t *testing.T) {
 		sentinelPassword, sentinelEnvID))
 
 	sctx, span := StartStepSpanTracer(ctx, otelTracer(tracerName), mt, "create_database", 2, 3)
-	if !trace.SpanContextFromContext(sctx).IsValid() {
+	joined := trace.SpanContextFromContext(sctx)
+	if !joined.IsValid() {
 		t.Fatal("expected the step span to join the trace carried in metadata")
+	}
+	if want, _ := trace.TraceIDFromHex("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"); joined.TraceID() != want {
+		t.Fatalf("step span started trace %s, want the traceparent's trace aaaa…", joined.TraceID())
 	}
 	span.SetAttributes(attribute.String("note", "plain text"))
 	EndStepSpan(span, "done")
@@ -99,6 +109,68 @@ func TestSpansExcludeSecretsAndIDs(t *testing.T) {
 		httptest.NewRecorder(),
 		httptest.NewRequest("POST", "/v1/environments/"+sentinelEnvID, nil))
 	assertNoSentinels(t, "request span", rec)
+
+	// A two-segment path (GET /v1/{id}) is exactly the boundary the route
+	// allowlist exists for: the id-bearing segment must not reach the
+	// http.route attribute — neither verbatim, nor as anything else the
+	// client could have influenced. All recorded routes are fixed strings.
+	rec.Reset()
+	TraceRequests(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {})).ServeHTTP(
+		httptest.NewRecorder(),
+		httptest.NewRequest("GET", "/v1/"+sentinelEnvID, nil))
+	gotRoute := ""
+	for _, sp := range rec.Ended() {
+		for _, attr := range sp.Attributes() {
+			if attr.Key == "http.route" {
+				gotRoute = attr.Value.Emit()
+			}
+		}
+	}
+	if gotRoute != "/v1" {
+		t.Fatalf("two-segment id path recorded as route %q, want fixed /v1", gotRoute)
+	}
+	// An arbitrary non-API shape collapses to the opaque bucket rather than
+	// carrying client text.
+	rec.Reset()
+	TraceRequests(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {})).ServeHTTP(
+		httptest.NewRecorder(),
+		httptest.NewRequest("GET", "/"+sentinelEnvID+"-arbitrary/free-text", nil))
+	assertNoSentinels(t, "fallback request span", rec)
+	for _, sp := range rec.Ended() {
+		for _, attr := range sp.Attributes() {
+			if attr.Key == "http.route" && attr.Value.Emit() != "/other" {
+				t.Fatalf("unknown path recorded as route %q, want /other", attr.Value.Emit())
+			}
+		}
+	}
+}
+
+// TestStepSpanPreservesParentCancellation pins the shutdown-safety property
+// the traceparent join depends on: extracting the remote span context must
+// derive from the caller's context, so a cancelled worker run context still
+// cancels the step's execution context even when its metadata carries a valid
+// traceparent.
+func TestStepSpanPreservesParentCancellation(t *testing.T) {
+	_, undo := withRecorder(t)
+	defer undo()
+
+	parent, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	mt := []byte(`{"traceparent":"00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01"}`)
+	sctx, span := StartStepSpanTracer(
+		parent, otelTracer(tracerName), mt, "create_database", 0, 1)
+	span.End()
+	cancel()
+
+	if err := parent.Err(); err == nil {
+		t.Fatal("parent context lost its cancellation")
+	}
+	select {
+	case <-sctx.Done():
+	default:
+		t.Fatal("step context derived from a cancelled parent is not cancelled")
+	}
 }
 
 // TestTraceparentRoundTrip covers the step-metadata round trip.

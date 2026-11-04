@@ -54,17 +54,42 @@ func EndProvisioningSpan(span trace.Span, ok bool) {
 	span.End()
 }
 
-// routePrefix scopes a request path to its bounded route prefix: the first
-// three segments (e.g. /v1/environments/{id}→ "/v1/environments", the missing
-// parts collapsed so ids never appear).
+// routePrefix maps a request path onto a fixed route allowlist — every route
+// this service actually serves. Paths outside the allowlist never reach
+// http.route as their own label: a one-segment path under /v1 carries an
+// environment id at its second segment by construction, and any unrelated
+// shape is client-supplied text, so both collapse. UUID-shaped text is
+// stripped even inside the allowed prefixes, and every kept segment is
+// scrubbed and bounded, so http.route can never carry an environment id or
+// unbounded client text.
 func routePrefix(path string) string {
-	segments := strings.SplitN(strings.Trim(path, "/"), "/", 3)
-	if len(segments) > 2 {
-		// The third segment is an identifier by construction in every route
-		// of this service; drop it from the recorded route.
-		segments = segments[:2]
+	if strings.Trim(path, "/") == "" {
+		return "/"
 	}
-	return "/" + strings.Join(segments, "/")
+	segments := strings.Split(strings.Trim(path, "/"), "/")
+	switch {
+	case len(segments) >= 2 && segments[0] == "v1" && segments[1] == "environments":
+		// /v1/environments/{id}[/{sub-resource}] — the third segment on is
+		// an identifier by construction in every route of this shape; the
+		// route itself ends at the prefix.
+		segments = segments[:2]
+	case segments[0] == "healthz" || segments[0] == "readyz" || segments[0] == "metrics":
+		// Fixed-name unary routes.
+		segments = segments[:1]
+	case segments[0] == "v1":
+		// An unknown route under the versioned prefix: record the version
+		// only, never the client-supplied segment under it.
+		segments = segments[:1]
+	default:
+		// Anything else is not a route this service serves, so not even
+		// its first segment is trusted; record an opaque bounded bucket.
+		segments = []string{"other"}
+	}
+	out := make([]string, 0, len(segments))
+	for _, s := range segments {
+		out = append(out, redactSpanText(s))
+	}
+	return "/" + strings.Join(out, "/")
 }
 
 // TraceRequests wraps a handler tracing middleware semantics: one span per
@@ -117,19 +142,24 @@ func traceparentString(sc trace.SpanContext) string {
 }
 
 // ReadStepTraceparent extracts the trace context wire string from a step's
-// metadata document; ok is false when the metadata carries none.
+// metadata document; ok is false when the metadata carries none. The document
+// is decoded as map[string]any (as WriteStepTraceparent draws it): step
+// metadata carries non-string values too (e.g. the rotation entry written by
+// CompleteRotation), and a string-only decode would fail to parse and
+// silently detach that step's span from its trace.
 func ReadStepTraceparent(metadata []byte) (traceparent string, ok bool) {
 	if len(metadata) == 0 {
 		return "", false
 	}
-	var doc map[string]string
+	var doc map[string]any
 	if json.Unmarshal(metadata, &doc) != nil {
 		return "", false
 	}
-	if doc[traceparentMetadataKey] == "" {
+	tp, _ := doc[traceparentMetadataKey].(string)
+	if tp == "" {
 		return "", false
 	}
-	return doc[traceparentMetadataKey], true
+	return tp, true
 }
 
 // WriteStepTraceparent merges the trace context into a step metadata document
@@ -161,11 +191,14 @@ func stepTraceContext(ctx context.Context, metadata []byte) context.Context {
 	if !ok {
 		return ctx
 	}
-	carrier := map[string]string{traceparentMetadataKey: tp}
-	remote := otel.GetTextMapPropagator().Extract(
-		context.Background(), propagation.MapCarrier(carrier))
-	if trace.SpanContextFromContext(remote).IsValid() {
-		return remote
+	carrier := propagation.MapCarrier(map[string]string{traceparentMetadataKey: tp})
+	// Extract derives from the caller's ctx, so a remote span context is
+	// layered on top of it — cancellation, deadlines and the worker's run
+	// values all survive the join. Extracting into context.Background()
+	// would detach the step from the run and break graceful shutdown.
+	joined := otel.GetTextMapPropagator().Extract(ctx, carrier)
+	if trace.SpanContextFromContext(joined).IsValid() {
+		return joined
 	}
 	return ctx
 }

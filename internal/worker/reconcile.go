@@ -206,9 +206,14 @@ func (p *Pool) recordReconcileOutcome(
 		return // only a recorded verdict is a metric fact
 	}
 	// Phase 8: one reconciliation verdict, labelled by the decision the
-	// reconciler landed, and its latency-series consequences.
+	// reconciler landed, and its latency-series consequences. A failed
+	// verdict with retry budget left is NOT terminal — the resume sweep
+	// re-schedules the step — so `final` is derived from retry eligibility,
+	// never asserted: a re-scheduled step must not emit a failed duration
+	// that a later successful or exhausted retry would double-count.
+	final := state != domain.StepFailed || !p.retryEligible(step)
 	p.Tele.ObserveReconciliation(ctx, reconcileDecisionFor(state))
-	p.observeStepOutcome(ctx, step, state, true, outcomeFromReconcile)
+	p.observeStepOutcome(ctx, step, state, final, outcomeFromReconcile)
 	if state != domain.StepInDoubt && state != domain.StepFailed && isCleanupKind(step.Kind) {
 		p.maybeFinalizeCleanup(nctx, log, step)
 	}
@@ -243,17 +248,22 @@ func (p *Pool) maybeFinalizeCleanup(ctx context.Context, log *slog.Logger, step 
 	}
 }
 
-// maybeScheduleRetry reschedules a just-failed step for another attempt
-// while its persisted attempts are under the cap. The cap is read from the
-// claimed row (step.Attempts): a retry the worker died before scheduling is
-// never remembered locally, so the budget is the ROW's, and a step that
-// exhausted it stays failed for an operator instead of looping forever. It
-// reports whether a retry was actually scheduled — so the caller can tell a
-// transient failure (retry pending) from a final one (the failed terminal
-// outcome must be emitted to metrics now, and nothing else will).
-func (p *Pool) maybeScheduleRetry(ctx context.Context, log *slog.Logger, step domain.Step) bool {
+// retryEligible reports whether the row still has retry budget left, i.e.
+// whether a failure on it is transient by construction: the resume sweep
+// (or the executor path) will schedule another attempt, so no terminal
+// duration may be recorded yet. The cap is read from the claimed row
+// (step.Attempts): a retry the worker died before scheduling is never
+// remembered locally, so the budget is the ROW's, and a step that exhausted
+// it stays failed for an operator instead of looping forever.
+func (p *Pool) retryEligible(step domain.Step) bool {
 	maxAttempts := p.getMaxAttempts()
-	if maxAttempts <= 0 || step.Attempts >= maxAttempts {
+	return maxAttempts > 0 && step.Attempts < maxAttempts
+}
+
+// maybeScheduleRetry reschedules a just-failed step for another attempt
+// while its persisted attempts are under the cap.
+func (p *Pool) maybeScheduleRetry(ctx context.Context, log *slog.Logger, step domain.Step) bool {
+	if !p.retryEligible(step) {
 		return false // retry budget exhausted or scheduling disabled: stays failed
 	}
 	delay := p.retryDelay(step.Attempts)
@@ -266,7 +276,7 @@ func (p *Pool) maybeScheduleRetry(ctx context.Context, log *slog.Logger, step do
 		return false
 	}
 	log.Info("worker scheduled a step retry",
-		"step_id", step.ID, "attempts", step.Attempts, "max_attempts", maxAttempts, "delay", delay)
+		"step_id", step.ID, "attempts", step.Attempts, "max_attempts", p.getMaxAttempts(), "delay", delay)
 	return true
 }
 

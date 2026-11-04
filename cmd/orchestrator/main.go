@@ -33,11 +33,7 @@ func main() {
 		os.Exit(1)
 	}
 	defer func() {
-		ctx, cancel := context.WithTimeout(context.Background(), telemetry.ShutdownTimeout)
-		defer cancel()
-		if err := shutdown(ctx); err != nil {
-			log.Warn("telemetry shutdown incomplete", "err", err)
-		}
+		shutdownTelemetry(shutdown, log)
 	}()
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -46,12 +42,26 @@ func main() {
 	app, err := app.New(ctx, cfg, log)
 	if err != nil {
 		log.Error("failed to start service", "err", err)
+		shutdownTelemetry(shutdown, log)
 		os.Exit(1)
 	}
 
 	if err := app.Run(ctx); err != nil {
 		log.Error("service stopped with error", "err", err)
+		shutdownTelemetry(shutdown, log)
 		os.Exit(1)
 	}
 	log.Info("stopped cleanly")
+}
+
+// shutdownTelemetry flushes queued spans and metric batches, bounded by
+// ShutdownTimeout. It runs on every exit path — including the error exits in
+// main — because os.Exit bypasses deferred calls and would otherwise drop
+// whatever telemetry the failed run produced.
+func shutdownTelemetry(shutdown func(context.Context) error, log *slog.Logger) {
+	ctx, cancel := context.WithTimeout(context.Background(), telemetry.ShutdownTimeout)
+	defer cancel()
+	if err := shutdown(ctx); err != nil {
+		log.Warn("telemetry shutdown incomplete", "err", err)
+	}
 }

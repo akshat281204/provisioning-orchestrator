@@ -19,10 +19,21 @@ func collectMetrics(t *testing.T, m *Metrics) string {
 }
 
 // TestMetricLabelsExcludeSecretsAndIDs covers the metric side of the phase-8
-// guarantee: every gathered family's label values may only contain bounded
-// enumeration values, never the sentinel password, never an environment id.
+// guarantee: every label-bearing helper is fed sentinel values first (a
+// would-be password, an environment id) and must not let either reach the
+// exposition — boundedLabel collapses them to the fallback bucket. The
+// run-observers after that use only genuine enum values.
 func TestMetricLabelsExcludeSecretsAndIDs(t *testing.T) {
 	m := NewMetrics()
+	// A sentinel plundered through every label-bearing path: step kind,
+	// reconcile decision, and the two outcome labels.
+	m.ObserveStepAttempt(t.Context(), sentinelEnvID)
+	m.ObserveReconciliation(t.Context(), sentinelEnvID)
+	m.ObserveProvisioningDuration(t.Context(), sentinelPassword, 0.1)
+	m.ObserveCleanupDuration(t.Context(), sentinelPassword, 0.1)
+
+	// Then one observation of each family with legitimate values, so every
+	// family exists in the exposition of this test too.
 	m.ObserveStepAttempt(t.Context(), "verify_usable")
 	m.IncLeaseExpiration(t.Context())
 	m.SetStepsInDoubt(3)
@@ -35,6 +46,20 @@ func TestMetricLabelsExcludeSecretsAndIDs(t *testing.T) {
 		if strings.Contains(body, s) {
 			t.Errorf("/metrics exposition leaks %q", s)
 		}
+	}
+	// The sentinels must have landed in the fallback bucket, not vanished:
+	// the families carry other-labelled series now.
+	if n := strings.Count(body, "provisioning_step_attempts_total{kind=\"other\"}"); n == 0 {
+		t.Error("sentinel step kind did not land in the fallback {kind=\"other\"} bucket")
+	}
+	if n := strings.Count(body, `provisioning_reconciliations_total{decision="other"}`); n == 0 {
+		t.Error("sentinel decision did not land in the fallback {decision=\"other\"} bucket")
+	}
+	if n := strings.Count(body, `provisioning_duration_seconds_bucket{outcome="other",le="+Inf"`); n == 0 {
+		t.Error("sentinel outcome did not land in the fallback {outcome=\"other\"} bucket")
+	}
+	if n := strings.Count(body, `cleanup_duration_seconds_bucket{outcome="other",le="+Inf"`); n == 0 {
+		t.Error("sentinel cleanup outcome did not land in the fallback {outcome=\"other\"} bucket")
 	}
 }
 

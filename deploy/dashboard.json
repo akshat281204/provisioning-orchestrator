@@ -3,9 +3,15 @@
   "uid": "provisioning-orchestrator",
   "schemaVersion": 39,
   "editable": true,
-  "time": { "from": "now-1h", "to": "now" },
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
   "refresh": "10s",
-  "tags": ["provisioning", "phase-8"],
+  "tags": [
+    "provisioning",
+    "phase-8"
+  ],
   "templating": {
     "list": [
       {
@@ -13,24 +19,43 @@
         "type": "query",
         "query": "label_values(up, job)",
         "refresh": 1,
-        "datasource": { "type": "prometheus", "uid": "provisioning-prometheus" },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "provisioning-prometheus"
+        },
         "includeAll": true,
-        "current": { "text": "All", "value": "$__all" }
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        }
       }
     ]
   },
   "panels": [
     {
       "id": 1,
-      "title": "Steps in doubt — the alert-worthy gauge",
+      "title": "Steps in doubt \u2014 the alert-worthy gauge",
       "description": "Steps whose outcome is ambiguous and awaiting reconciliation. They may or may not have left external state behind; anything above zero needs a reconciliation pass to resolve.",
       "type": "stat",
-      "gridPos": { "x": 0, "y": 0, "w": 8, "h": 6 },
-      "datasource": { "type": "prometheus", "uid": "provisioning-prometheus" },
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 8,
+        "h": 6
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "provisioning-prometheus"
+      },
       "targets": [
         {
           "expr": "provisioning_steps_in_doubt{job=~\"$job\"}",
-          "legendFormat": "in doubt"
+          "legendFormat": "in doubt",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "provisioning-prometheus"
+          }
         }
       ],
       "fieldConfig": {
@@ -38,9 +63,18 @@
           "thresholds": {
             "mode": "absolute",
             "steps": [
-              { "color": "green", "value": null },
-              { "color": "yellow", "value": 1 },
-              { "color": "red", "value": 10 }
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 10
+              }
             ]
           }
         },
@@ -52,12 +86,25 @@
       "title": "Lease expirations (observed worker deaths) per second",
       "description": "Steps claimed after their previous owner's lease expired. Sustained nonzero traffic means crashes or lost leases, not routine work.",
       "type": "timeseries",
-      "gridPos": { "x": 8, "y": 0, "w": 8, "h": 6 },
-      "datasource": { "type": "prometheus", "uid": "provisioning-prometheus" },
+      "gridPos": {
+        "x": 8,
+        "y": 0,
+        "w": 8,
+        "h": 6
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "provisioning-prometheus"
+      },
       "targets": [
         {
           "expr": "sum(rate(provisioning_lease_expirations_total{job=~\"$job\"}[5m]))",
-          "legendFormat": "expirations/s"
+          "legendFormat": "expirations/s",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "provisioning-prometheus"
+          }
         }
       ]
     },
@@ -66,12 +113,25 @@
       "title": "Reconciliation verdicts by decision",
       "description": "Reconciler outcomes over time. done/pending recycle work; failed ends a workflow; unobservable means the reconciler could not see the real world and the step stays in_doubt.",
       "type": "timeseries",
-      "gridPos": { "x": 16, "y": 0, "w": 8, "h": 6 },
-      "datasource": { "type": "prometheus", "uid": "provisioning-prometheus" },
+      "gridPos": {
+        "x": 16,
+        "y": 0,
+        "w": 8,
+        "h": 6
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "provisioning-prometheus"
+      },
       "targets": [
         {
           "expr": "sum(rate(provisioning_reconciliations_total{job=~\"$job\"}[5m])) by (decision)",
-          "legendFormat": "{{decision}}"
+          "legendFormat": "{{decision}}",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "provisioning-prometheus"
+          }
         }
       ]
     },
@@ -80,16 +140,34 @@
       "title": "Provisioning duration by outcome",
       "description": "Time from environment creation to a terminal provisioning outcome (ready, or a permanently failed step).",
       "type": "timeseries",
-      "gridPos": { "x": 0, "y": 6, "w": 12, "h": 7 },
-      "datasource": { "type": "prometheus", "uid": "provisioning-prometheus" },
+      "gridPos": {
+        "x": 0,
+        "y": 6,
+        "w": 12,
+        "h": 7
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "provisioning-prometheus"
+      },
       "targets": [
         {
           "expr": "histogram_quantile(0.5, sum(rate(provisioning_duration_seconds_bucket{job=~\"$job\"}[5m])) by (le, outcome))",
-          "legendFormat": "p50 {{outcome}}"
+          "legendFormat": "p50 {{outcome}}",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "provisioning-prometheus"
+          }
         },
         {
           "expr": "histogram_quantile(0.95, sum(rate(provisioning_duration_seconds_bucket{job=~\"$job\"}[5m])) by (le, outcome))",
-          "legendFormat": "p95 {{outcome}}"
+          "legendFormat": "p95 {{outcome}}",
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "provisioning-prometheus"
+          }
         }
       ]
     },
@@ -98,12 +176,25 @@
       "title": "Step attempts by kind",
       "description": "Execution attempts including retries and post-crash reclaims. A kind growing much faster than its siblings is retried or being reclaimed.",
       "type": "timeseries",
-      "gridPos": { "x": 12, "y": 6, "w": 12, "h": 7 },
-      "datasource": { "type": "prometheus", "uid": "provisioning-prometheus" },
+      "gridPos": {
+        "x": 12,
+        "y": 6,
+        "w": 12,
+        "h": 7
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "provisioning-prometheus"
+      },
       "targets": [
         {
           "expr": "sum(rate(provisioning_step_attempts_total{job=~\"$job\"}[5m])) by (kind)",
-          "legendFormat": "{{kind}}"
+          "legendFormat": "{{kind}}",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "provisioning-prometheus"
+          }
         }
       ]
     },
@@ -112,16 +203,34 @@
       "title": "Cleanup duration by outcome",
       "description": "Time from cleanup-plan creation to the cleanup workflow's conclusion (every compensation done, or a failed one left for an operator).",
       "type": "timeseries",
-      "gridPos": { "x": 0, "y": 13, "w": 12, "h": 7 },
-      "datasource": { "type": "prometheus", "uid": "provisioning-prometheus" },
+      "gridPos": {
+        "x": 0,
+        "y": 13,
+        "w": 12,
+        "h": 7
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "provisioning-prometheus"
+      },
       "targets": [
         {
           "expr": "histogram_quantile(0.5, sum(rate(cleanup_duration_seconds_bucket{job=~\"$job\"}[5m])) by (le, outcome))",
-          "legendFormat": "p50 {{outcome}}"
+          "legendFormat": "p50 {{outcome}}",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "provisioning-prometheus"
+          }
         },
         {
           "expr": "histogram_quantile(0.95, sum(rate(cleanup_duration_seconds_bucket{job=~\"$job\"}[5m])) by (le, outcome))",
-          "legendFormat": "p95 {{outcome}}"
+          "legendFormat": "p95 {{outcome}}",
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "provisioning-prometheus"
+          }
         }
       ]
     },
@@ -130,24 +239,52 @@
       "title": "Failures vs successes",
       "description": "Terminal outcome counts for provisioning and cleanup, as counters over rate.",
       "type": "timeseries",
-      "gridPos": { "x": 12, "y": 13, "w": 12, "h": 7 },
-      "datasource": { "type": "prometheus", "uid": "provisioning-prometheus" },
+      "gridPos": {
+        "x": 12,
+        "y": 13,
+        "w": 12,
+        "h": 7
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "provisioning-prometheus"
+      },
       "targets": [
         {
           "expr": "sum(rate(provisioning_duration_seconds_count{job=~\"$job\",outcome=\"failed\"}[5m]))",
-          "legendFormat": "provisioning failed/s"
+          "legendFormat": "provisioning failed/s",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "provisioning-prometheus"
+          }
         },
         {
           "expr": "sum(rate(provisioning_duration_seconds_count{job=~\"$job\",outcome=\"success\"}[5m]))",
-          "legendFormat": "provisioning success/s"
+          "legendFormat": "provisioning success/s",
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "provisioning-prometheus"
+          }
         },
         {
           "expr": "sum(rate(cleanup_duration_seconds_count{job=~\"$job\",outcome=\"failed\"}[5m]))",
-          "legendFormat": "cleanup failed/s"
+          "legendFormat": "cleanup failed/s",
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "provisioning-prometheus"
+          }
         },
         {
           "expr": "sum(rate(cleanup_duration_seconds_count{job=~\"$job\",outcome=\"success\"}[5m]))",
-          "legendFormat": "cleanup success/s"
+          "legendFormat": "cleanup success/s",
+          "refId": "D",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "provisioning-prometheus"
+          }
         }
       ]
     }

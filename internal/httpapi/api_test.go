@@ -44,7 +44,7 @@ func newFakeStore() *fakeStore {
 func keyOf(tenantID, idemKey string) string { return tenantID + "\x00" + idemKey }
 
 func (f *fakeStore) CreateEnvironmentWithPlan(
-	_ context.Context, env domain.Environment, plan []domain.PlannedStep,
+	_ context.Context, env domain.Environment, plan []domain.PlannedStep, traceparent string,
 ) (domain.Environment, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -435,7 +435,7 @@ func TestHistoryReturnsRedactedTimelineOnly(t *testing.T) {
 		// one; neither may reach the response.
 		Metadata: []byte(`{"internalNote":"secret-material-XYZ"}`),
 	}
-	if _, err := fs.CreateEnvironmentWithPlan(context.Background(), env, domain.Plan()); err != nil {
+	if _, err := fs.CreateEnvironmentWithPlan(context.Background(), env, domain.Plan(), ""); err != nil {
 		t.Fatalf("seed env: %v", err)
 	}
 	// A failed step whose last_error is what a driver would emit with the
@@ -505,7 +505,7 @@ func TestGetEnvironmentExposesConnectionFieldsButNeverMetadata(t *testing.T) {
 		// it, with a password-shaped extra key that must never surface.
 		Metadata: []byte(`{"host":"db.internal","database":"app","credentialRef":"oracle/cred/env-m","password":"hunter2"}`),
 	}
-	if _, err := fs.CreateEnvironmentWithPlan(context.Background(), env, domain.Plan()); err != nil {
+	if _, err := fs.CreateEnvironmentWithPlan(context.Background(), env, domain.Plan(), ""); err != nil {
 		t.Fatalf("seed env: %v", err)
 	}
 
@@ -533,7 +533,7 @@ func TestGetEnvironmentWithNoConnectionFieldsOmitsThem(t *testing.T) {
 		State:          domain.EnvPending,
 		IdempotencyKey: "k", Spec: []byte(`{}`), Metadata: []byte(`{}`),
 	}
-	if _, err := fs.CreateEnvironmentWithPlan(context.Background(), env, domain.Plan()); err != nil {
+	if _, err := fs.CreateEnvironmentWithPlan(context.Background(), env, domain.Plan(), ""); err != nil {
 		t.Fatalf("seed env: %v", err)
 	}
 
@@ -640,7 +640,7 @@ func acquireEnv(t *testing.T, fs *fakeStore, state domain.EnvState) string {
 		State:          state,
 		IdempotencyKey: "k-" + string(state), Spec: []byte(`{}`), Metadata: []byte(`{}`),
 	}
-	if _, err := fs.CreateEnvironmentWithPlan(context.Background(), env, domain.Plan()); err != nil {
+	if _, err := fs.CreateEnvironmentWithPlan(context.Background(), env, domain.Plan(), ""); err != nil {
 		t.Fatalf("seed env: %v", err)
 	}
 	return env.ID

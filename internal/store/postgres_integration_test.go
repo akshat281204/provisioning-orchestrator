@@ -233,7 +233,7 @@ func TestCreateEnvironmentWithPlanAtomicity(t *testing.T) {
 
 	// (a) A successful call leaves both the environment and all plan steps.
 	env := sampleEnv(t)
-	created, err := st.CreateEnvironmentWithPlan(ctx, env, domain.Plan())
+	created, err := st.CreateEnvironmentWithPlan(ctx, env, domain.Plan(), "")
 	if err != nil {
 		t.Fatalf("create environment with plan: %v", err)
 	}
@@ -260,7 +260,7 @@ func TestCreateEnvironmentWithPlanAtomicity(t *testing.T) {
 	// and leaves exactly one environment and one plan.
 	dup := env
 	dup.ID = fmt.Sprintf("22222222-0000-4000-8000-%012d", time.Now().UnixNano()%1e12)
-	if _, err := st.CreateEnvironmentWithPlan(ctx, dup, domain.Plan()); !errors.Is(err, store.ErrDuplicate) {
+	if _, err := st.CreateEnvironmentWithPlan(ctx, dup, domain.Plan(), ""); !errors.Is(err, store.ErrDuplicate) {
 		t.Fatalf("expected ErrDuplicate, got %v", err)
 	}
 	if err := pool.QueryRow(ctx, `SELECT count(*) FROM environments WHERE id = $1`, dup.ID).Scan(&envCount); err != nil {
@@ -290,7 +290,7 @@ func TestCreateEnvironmentWithPlanAtomicity(t *testing.T) {
 	failed.ID = fmt.Sprintf("33333333-0000-4000-8000-%012d", time.Now().UnixNano()%1e12)
 	badPlan := domain.Plan()
 	badPlan[1].Index = badPlan[0].Index
-	if _, err := st.CreateEnvironmentWithPlan(ctx, failed, badPlan); !errors.Is(err, store.ErrDuplicate) {
+	if _, err := st.CreateEnvironmentWithPlan(ctx, failed, badPlan, ""); !errors.Is(err, store.ErrDuplicate) {
 		t.Fatalf("expected ErrDuplicate from the duplicated step index, got %v", err)
 	}
 	if err := pool.QueryRow(ctx, `SELECT count(*) FROM environments WHERE id = $1`, failed.ID).Scan(&envCount); err != nil {
@@ -346,7 +346,7 @@ WHERE schemaname = 'public'`)
 func seedEnvWithPlan(t *testing.T, st *store.PostgresStore, n int) domain.Environment {
 	t.Helper()
 	env := sampleEnv(t)
-	if _, err := st.CreateEnvironmentWithPlan(context.Background(), env, domain.Plan()[:n]); err != nil {
+	if _, err := st.CreateEnvironmentWithPlan(context.Background(), env, domain.Plan()[:n], ""); err != nil {
 		t.Fatalf("seed environment with plan: %v", err)
 	}
 	return env
@@ -556,7 +556,7 @@ func TestBeginCleanupIsIdempotentOnRealSQL(t *testing.T) {
 	ctx := context.Background()
 
 	env := sampleEnv(t)
-	if _, err := st.CreateEnvironmentWithPlan(ctx, env, domain.Plan()); err != nil {
+	if _, err := st.CreateEnvironmentWithPlan(ctx, env, domain.Plan(), ""); err != nil {
 		t.Fatalf("seed env with plan: %v", err)
 	}
 
@@ -640,7 +640,7 @@ func TestReconciliationClaimKeepsAmbiguityOnRealSQL(t *testing.T) {
 	ctx := context.Background()
 
 	env := sampleEnv(t)
-	if _, err := st.CreateEnvironmentWithPlan(ctx, env, domain.Plan()[:1]); err != nil {
+	if _, err := st.CreateEnvironmentWithPlan(ctx, env, domain.Plan()[:1], ""); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 	claimed, err := st.ClaimNextStep(ctx, "w1", time.Minute)
@@ -692,7 +692,7 @@ func TestReconciliationClaimKeepsAmbiguityOnRealSQL(t *testing.T) {
 
 	// The reaper returns an abandoned claim to the queue, still in_doubt.
 	env2 := sampleEnv(t)
-	if _, err := st.CreateEnvironmentWithPlan(ctx, env2, domain.Plan()[:1]); err != nil {
+	if _, err := st.CreateEnvironmentWithPlan(ctx, env2, domain.Plan()[:1], ""); err != nil {
 		t.Fatalf("seed env2: %v", err)
 	}
 	c2, err := st.ClaimNextStep(ctx, "w2", time.Minute)
@@ -752,7 +752,7 @@ func TestReconcileVerdictAndResumeCommitTogetherOnRealSQL(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			env := sampleEnv(t)
-			if _, err := st.CreateEnvironmentWithPlan(ctx, env, domain.Plan()); err != nil {
+			if _, err := st.CreateEnvironmentWithPlan(ctx, env, domain.Plan(), ""); err != nil {
 				t.Fatalf("seed: %v", err)
 			}
 			if err := st.BeginProvisioning(ctx, env.ID); err != nil {
@@ -825,7 +825,7 @@ func TestCleanupClaimsWaitForForwardWorkAndOrderOnRealSQL(t *testing.T) {
 	ctx := context.Background()
 
 	env := sampleEnv(t)
-	if _, err := st.CreateEnvironmentWithPlan(ctx, env, domain.Plan()); err != nil {
+	if _, err := st.CreateEnvironmentWithPlan(ctx, env, domain.Plan(), ""); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 	if _, err := st.BeginCleanup(ctx, env.ID, domain.EnvDeleting); err != nil {
@@ -924,7 +924,7 @@ func TestFinalizeCleanupReportsFailedNotDeletedOnRealSQL(t *testing.T) {
 	ctx := context.Background()
 
 	env := sampleEnv(t)
-	if _, err := st.CreateEnvironmentWithPlan(ctx, env, domain.Plan()); err != nil {
+	if _, err := st.CreateEnvironmentWithPlan(ctx, env, domain.Plan(), ""); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 	if _, err := st.BeginCleanup(ctx, env.ID, domain.EnvCancelling); err != nil {
@@ -991,7 +991,7 @@ func TestFinalizeCleanupFailedEarlyCleanupStepMarksFailedOnRealSQL(t *testing.T)
 	ctx := context.Background()
 
 	env := sampleEnv(t)
-	if _, err := st.CreateEnvironmentWithPlan(ctx, env, domain.Plan()); err != nil {
+	if _, err := st.CreateEnvironmentWithPlan(ctx, env, domain.Plan(), ""); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 	if _, err := st.BeginCleanup(ctx, env.ID, domain.EnvCancelling); err != nil {
@@ -1046,7 +1046,7 @@ func TestCleanupPlanSequencingOnRealSQL(t *testing.T) {
 	ctx := context.Background()
 
 	env := sampleEnv(t)
-	if _, err := st.CreateEnvironmentWithPlan(ctx, env, domain.Plan()); err != nil {
+	if _, err := st.CreateEnvironmentWithPlan(ctx, env, domain.Plan(), ""); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 	if _, err := st.BeginCleanup(ctx, env.ID, domain.EnvDeleting); err != nil {
