@@ -61,6 +61,10 @@ up: ## Start postgres, vault, otel-collector, prometheus
 down: ## Stop the local stack
 	docker compose down -v
 
+.PHONY: migrate
+migrate: ## Apply embedded SQL migrations to the configured database
+	$(GO) run ./cmd/migrate
+
 .PHONY: logs
 logs: ## Tail the local stack
 	docker compose logs -f --tail=100
