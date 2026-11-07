@@ -21,6 +21,7 @@ import (
 	"github.com/akshat281204/provisioning-orchestrator/internal/health"
 	"github.com/akshat281204/provisioning-orchestrator/internal/httpapi"
 	"github.com/akshat281204/provisioning-orchestrator/internal/store"
+	"github.com/akshat281204/provisioning-orchestrator/internal/worker"
 )
 
 // maxRequestIDLen bounds how long a client-supplied X-Request-Id may be
@@ -34,6 +35,7 @@ type App struct {
 	server   *http.Server
 	registry *health.Registry
 	pool     *pgxpool.Pool
+	workers  *worker.Pool
 }
 
 // New builds the application without starting anything. The Postgres pool
@@ -63,6 +65,17 @@ func New(ctx context.Context, cfg config.Config, log *slog.Logger) (*App, error)
 			health.NewVaultChecker(vaultClient),
 		),
 		pool: pool,
+		// The worker pool shares the API's database pool: steps advance with
+		// no central scheduler, claiming rows from the same tables the HTTP
+		// API writes. Phase 5 swaps NoopExecutor for the real adapters.
+		workers: &worker.Pool{
+			Concurrency:   cfg.WorkerConcurrency,
+			LeaseDuration: cfg.LeaseDuration,
+			StepTimeout:   cfg.StepTimeout,
+			Store:         store.NewPostgresStore(pool),
+			Executor:      worker.NoopExecutor{},
+			Log:           log,
+		},
 	}
 
 	mux := http.NewServeMux()
@@ -99,6 +112,16 @@ func (a *App) Run(ctx context.Context) error {
 		}
 	}()
 
+	// The worker pool runs for the lifetime of the app and exits when ctx
+	// is cancelled, releasing any in-flight step back to pending.
+	workersDone := make(chan struct{})
+	go func() {
+		defer close(workersDone)
+		if err := a.workers.Run(ctx); err != nil {
+			a.log.Error("worker pool stopped with error", "err", err)
+		}
+	}()
+
 	select {
 	case err := <-errCh:
 		return err
@@ -111,6 +134,13 @@ func (a *App) Run(ctx context.Context) error {
 	//nolint:contextcheck // graceful shutdown needs a context detached from the cancelled run ctx
 	if err := a.server.Shutdown(shutdownCtx); err != nil {
 		return fmt.Errorf("app: graceful shutdown: %w", err)
+	}
+	// Draining requests first lets in-flight API calls finish; the pool then
+	// releases its steps before the pgx pool closes (deferred above).
+	select {
+	case <-workersDone:
+	case <-shutdownCtx.Done():
+		return fmt.Errorf("app: worker pool did not stop in time")
 	}
 	return nil
 }
