@@ -211,6 +211,91 @@ func TestForeignKeyCascade(t *testing.T) {
 	}
 }
 
+// TestCreateEnvironmentWithPlanAtomicity pins the phase-3 headline promise:
+// the environment row and every plan step row land in one transaction, a
+// duplicate idempotency key writes nothing, and a step-insert failure rolls
+// the environment row back. Needs Postgres (tag-gated, `make test-integration`).
+func TestCreateEnvironmentWithPlanAtomicity(t *testing.T) {
+	pool, st := newTestStore(t)
+	migrate(t, pool)
+	ctx := context.Background()
+
+	// (a) A successful call leaves both the environment and all plan steps.
+	env := sampleEnv(t)
+	created, err := st.CreateEnvironmentWithPlan(ctx, env, domain.Plan())
+	if err != nil {
+		t.Fatalf("create environment with plan: %v", err)
+	}
+	if created.ID != env.ID {
+		t.Fatalf("created id = %s, want %s", created.ID, env.ID)
+	}
+	var envCount, stepCount int
+	if err := pool.QueryRow(ctx,
+		`SELECT count(*) FROM environments WHERE id = $1`, env.ID).Scan(&envCount); err != nil {
+		t.Fatalf("count environments: %v", err)
+	}
+	if err := pool.QueryRow(ctx,
+		`SELECT count(*) FROM workflow_steps WHERE environment_id = $1`, env.ID).Scan(&stepCount); err != nil {
+		t.Fatalf("count steps: %v", err)
+	}
+	if envCount != 1 {
+		t.Fatalf("expected 1 environment row, got %d", envCount)
+	}
+	if stepCount != len(domain.Plan()) {
+		t.Fatalf("expected %d step rows, got %d", len(domain.Plan()), stepCount)
+	}
+
+	// (b) A repeated (tenant_id, idempotency_key) insert returns ErrDuplicate
+	// and leaves exactly one environment and one plan.
+	dup := env
+	dup.ID = fmt.Sprintf("22222222-0000-4000-8000-%012d", time.Now().UnixNano()%1e12)
+	if _, err := st.CreateEnvironmentWithPlan(ctx, dup, domain.Plan()); !errors.Is(err, store.ErrDuplicate) {
+		t.Fatalf("expected ErrDuplicate, got %v", err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM environments WHERE id = $1`, dup.ID).Scan(&envCount); err != nil {
+		t.Fatalf("count environments after duplicate: %v", err)
+	}
+	if envCount != 0 {
+		t.Fatalf("duplicate idempotency key must write nothing, got %d environment rows", envCount)
+	}
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM environments WHERE tenant_id = $1 AND idempotency_key = $2`,
+		env.TenantID, env.IdempotencyKey).Scan(&envCount); err != nil {
+		t.Fatalf("count environments by key: %v", err)
+	}
+	if envCount != 1 {
+		t.Fatalf("replayed key must leave exactly one environment, got %d", envCount)
+	}
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM workflow_steps WHERE environment_id = $1`, env.ID).Scan(&stepCount); err != nil {
+		t.Fatalf("count steps after duplicate: %v", err)
+	}
+	if stepCount != len(domain.Plan()) {
+		t.Fatalf("replayed key must leave exactly one plan, got %d steps", stepCount)
+	}
+
+	// (c) A step-insert failure rolls the environment row back: a plan with a
+	// duplicated Index violates unique (environment_id, step_index) after the
+	// environment insert already succeeded inside the transaction.
+	failed := sampleEnv(t)
+	failed.ID = fmt.Sprintf("33333333-0000-4000-8000-%012d", time.Now().UnixNano()%1e12)
+	badPlan := domain.Plan()
+	badPlan[1].Index = badPlan[0].Index
+	if _, err := st.CreateEnvironmentWithPlan(ctx, failed, badPlan); !errors.Is(err, store.ErrDuplicate) {
+		t.Fatalf("expected ErrDuplicate from the duplicated step index, got %v", err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM environments WHERE id = $1`, failed.ID).Scan(&envCount); err != nil {
+		t.Fatalf("count environments after rollback: %v", err)
+	}
+	if envCount != 0 {
+		t.Fatalf("a failed plan insert must roll the environment row back, found %d", envCount)
+	}
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM workflow_steps WHERE environment_id = $1`, failed.ID).Scan(&stepCount); err != nil {
+		t.Fatalf("count steps after rollback: %v", err)
+	}
+	if stepCount != 0 {
+		t.Fatalf("a failed plan insert must write no steps, found %d", stepCount)
+	}
+}
+
 func TestNoExtraTablesExist(t *testing.T) {
 	pool, _ := newTestStore(t)
 	migrate(t, pool)

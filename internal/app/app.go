@@ -19,6 +19,8 @@ import (
 
 	"github.com/akshat281204/provisioning-orchestrator/internal/config"
 	"github.com/akshat281204/provisioning-orchestrator/internal/health"
+	"github.com/akshat281204/provisioning-orchestrator/internal/httpapi"
+	"github.com/akshat281204/provisioning-orchestrator/internal/store"
 )
 
 // maxRequestIDLen bounds how long a client-supplied X-Request-Id may be
@@ -66,6 +68,11 @@ func New(ctx context.Context, cfg config.Config, log *slog.Logger) (*App, error)
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", a.handleHealth)
 	mux.HandleFunc("GET /readyz", a.handleReady)
+
+	// The /v1 surface is served by its own package against the same pool a
+	// worker (later phases) will claim work from.
+	v1 := httpapi.New(store.NewPostgresStore(pool))
+	mux.Handle("/v1/", http.StripPrefix("/v1", v1.Handler()))
 
 	a.server = &http.Server{
 		Addr:              cfg.HTTPAddr,
