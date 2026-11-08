@@ -17,6 +17,7 @@ import (
 	vault "github.com/hashicorp/vault/api"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/akshat281204/provisioning-orchestrator/internal/adapters"
 	"github.com/akshat281204/provisioning-orchestrator/internal/config"
 	"github.com/akshat281204/provisioning-orchestrator/internal/health"
 	"github.com/akshat281204/provisioning-orchestrator/internal/httpapi"
@@ -27,6 +28,33 @@ import (
 // maxRequestIDLen bounds how long a client-supplied X-Request-Id may be
 // before it is replaced with a generated id.
 const maxRequestIDLen = 64
+
+// newWorkerPool builds the lease pool and its real executor. The Postgres
+// adapters share the app's pool and drive their DDL with the same
+// credentials; Vault holds the provisioned credentials under its default
+// dev-mode mount.
+func newWorkerPool(
+	cfg config.Config, pool *pgxpool.Pool, vaultClient *vault.Client, log *slog.Logger,
+) *worker.Pool {
+	capacity := adapters.NewLocalCapacity(pool, log)
+	databases := adapters.NewLocalDatabases(pool, cfg.DatabaseURL, log)
+	roles := adapters.NewLocalRoles(pool, cfg.DatabaseURL, log)
+	secrets := adapters.NewVaultSecrets(vaultClient, "secret")
+	secrets.Log = log
+	return &worker.Pool{
+		Concurrency:   cfg.WorkerConcurrency,
+		LeaseDuration: cfg.LeaseDuration,
+		StepTimeout:   cfg.StepTimeout,
+		Store:         store.NewPostgresStore(pool),
+		Executor: &worker.AdapterExecutor{
+			Capacity:  capacity,
+			Databases: databases,
+			Roles:     roles,
+			Secrets:   secrets,
+		},
+		Log: log,
+	}
+}
 
 // App owns the long-lived components of the service.
 type App struct {
@@ -67,15 +95,9 @@ func New(ctx context.Context, cfg config.Config, log *slog.Logger) (*App, error)
 		pool: pool,
 		// The worker pool shares the API's database pool: steps advance with
 		// no central scheduler, claiming rows from the same tables the HTTP
-		// API writes. Phase 5 swaps NoopExecutor for the real adapters.
-		workers: &worker.Pool{
-			Concurrency:   cfg.WorkerConcurrency,
-			LeaseDuration: cfg.LeaseDuration,
-			StepTimeout:   cfg.StepTimeout,
-			Store:         store.NewPostgresStore(pool),
-			Executor:      worker.NoopExecutor{},
-			Log:           log,
-		},
+		// API writes. Steps run through the phase-5 adapters; every
+		// operation is idempotent, so retries after crashes converge.
+		workers: newWorkerPool(cfg, pool, vaultClient, log),
 	}
 
 	mux := http.NewServeMux()
