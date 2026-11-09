@@ -27,6 +27,10 @@ type Store interface {
 	ClaimNextStep(ctx context.Context, owner string, lease time.Duration) (domain.Step, error)
 	RenewLease(ctx context.Context, stepID, owner string, lease time.Duration) error
 	CompleteStep(ctx context.Context, stepID, owner string, state domain.StepState, lastErr string) error
+	// CompleteVerification marks the verification step done and flips the
+	// environment to ready in one transaction. Because `ready` exists only
+	// here, a verification that never succeeds can never lend its readiness.
+	CompleteVerification(ctx context.Context, stepID, owner, environmentID string) error
 	ReleaseStep(ctx context.Context, stepID, owner string) error
 }
 
@@ -76,8 +80,11 @@ type Pool struct {
 	Log *slog.Logger
 }
 
-// compile-time guard that the real store satisfies the worker's interface.
-var _ Store = (*store.PostgresStore)(nil)
+// compile-time guard that the real store satisfies the worker's interfaces.
+var (
+	_ Store   = (*store.PostgresStore)(nil)
+	_ EnvGate = (*store.PostgresStore)(nil)
+)
 
 // newOwnerID produces a fresh worker identity, used as lease_owner.
 func newOwnerID() string {
@@ -235,6 +242,24 @@ func (p *Pool) execute(ctx context.Context, log *slog.Logger, owner string, step
 
 	if execErr != nil {
 		p.recordOutcome(ctx, log, owner, step, domain.StepFailed, execErr.Error())
+		return true
+	}
+	if step.Kind == domain.KindVerifyUsable {
+		// Ready only ever lands in the same transaction that marks the
+		// verification step done: no side channel, no race, no claim of
+		// readiness the workflow did not earn.
+		err := p.Store.CompleteVerification(ctx, step.ID, owner, step.EnvironmentID)
+		switch {
+		case errors.Is(err, store.ErrNotFound):
+			log.Warn("worker lost the lease before recording verification",
+				"step_id", step.ID, "err", err)
+		case err != nil:
+			log.Error("worker could not record the verification outcome",
+				"step_id", step.ID, "err", err)
+		default:
+			log.Info("worker recorded verification; environment ready",
+				"step_id", step.ID, "step_index", step.StepIndex, "environment_id", step.EnvironmentID)
+		}
 		return true
 	}
 	p.recordOutcome(ctx, log, owner, step, domain.StepDone, "")

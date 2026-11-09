@@ -138,6 +138,13 @@ func (f *fakeStore) CompleteStep(_ context.Context, stepID, owner string, state 
 	return fmt.Errorf("fake store: complete step %s: %w", stepID, store.ErrNotFound)
 }
 
+// CompleteVerification marks the verification step done under its lease.
+// Tests that exercise the ready gate use the env-aware fake; this fake
+// simply records the completion like CompleteStep does for a done step.
+func (f *fakeStore) CompleteVerification(ctx context.Context, stepID, owner, _ string) error {
+	return f.CompleteStep(ctx, stepID, owner, domain.StepDone, "")
+}
+
 // ReleaseStep returns a held step to pending; not holding it is a no-op.
 func (f *fakeStore) ReleaseStep(_ context.Context, stepID, owner string) error {
 	f.mu.Lock()

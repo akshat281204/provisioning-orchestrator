@@ -13,6 +13,9 @@ import (
 	"regexp"
 	"strings"
 
+	"log/slog"
+
+	"github.com/akshat281204/provisioning-orchestrator/internal/adapters"
 	"github.com/akshat281204/provisioning-orchestrator/internal/domain"
 	"github.com/akshat281204/provisioning-orchestrator/internal/store"
 )
@@ -35,11 +38,33 @@ type Store interface {
 	Get(ctx context.Context, id string) (domain.Environment, error)
 	// ListForEnvironment returns the steps ordered by index.
 	ListForEnvironment(ctx context.Context, environmentID string) ([]domain.Step, error)
+
+	// TransitionEnvironment CAS-moves the environment's state (the
+	// credential/rotation path only; `ready` is rejected at the store).
+	TransitionEnvironment(ctx context.Context, environmentID string, target domain.EnvState) error
+	// CompleteRotation records the rotation on the verify step's metadata
+	// and returns the environment to ready in one transaction.
+	CompleteRotation(ctx context.Context, environmentID string, entry []byte) error
+	// AcquireRotationLock serializes rotations for one environment across
+	// every caller and process: a caller that could not take it in time
+	// receives an error wrapping store.ErrRotationBusy. The release function
+	// must be called exactly once, when the rotation attempt is finished.
+	// Without the lock, two overlapping rotations could each write a
+	// different new password to Vault and the role, leaving the stored
+	// credential non-connecting.
+	AcquireRotationLock(ctx context.Context, environmentID string) (func() error, error)
 }
 
 // API serves the /v1 routes.
 type API struct {
 	envs Store
+	// secrets, roles and verifier back the credential retrieval and
+	// rotation endpoints; nil disables the endpoints (fail closed).
+	secrets  adapters.Secrets
+	roles    adapters.Roles
+	verifier adapters.Verifier
+	policy   CredentialPolicy
+	auditLog *slog.Logger
 }
 
 // compile-time check that the concrete store keeps satisfying the handler
@@ -57,6 +82,8 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("POST /environments", a.createEnvironment)
 	mux.HandleFunc("GET /environments/{id}", a.getEnvironment)
 	mux.HandleFunc("GET /environments/{id}/history", a.getHistory)
+	mux.HandleFunc("POST /environments/{id}/credentials", a.retrieveCredentials)
+	mux.HandleFunc("POST /environments/{id}/rotate", a.rotateEnvironment)
 	return mux
 }
 
