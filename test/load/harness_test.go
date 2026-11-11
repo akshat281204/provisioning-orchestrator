@@ -236,17 +236,9 @@ func (r *loadRig) envState(t *testing.T, envID string) domain.EnvState {
 	return domain.EnvState(state)
 }
 
-// countDatabase / countRole / prefixDatabases / prefixRoles /
-// totalReservations read the real catalogs.
-//
-// The two count* helpers are existence checks by name: datname and rolname
-// are UNIQUE, so they can only return 0 or 1 and are structurally incapable
-// of seeing a duplicate. The duplicate detection lives in the prefix
-// snapshots (prefixDatabases / prefixRoles): the load test snapshots every
-// `px_`/`pu_` resource before and after the run and requires the delta to be
-// fully attributable to the run's environments, one resource each — so an
-// orphaned or unexplained resource fails the run even though it can never
-// share a name with a counted one.
+// countDatabase / countRole are existence checks by name. Prefix helpers
+// return exact catalog-name snapshots so load accounting can detect unexpected
+// resources even though individual catalog names are unique.
 func (r *loadRig) countDatabase(t *testing.T, name string) int {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -271,29 +263,41 @@ func (r *loadRig) countRole(t *testing.T, name string) int {
 	return n
 }
 
-// prefixDatabases counts every provisioned-prefixed database in the catalog.
-// `px\_` matches the literal prefix `px_` (the underscore is escaped, so it
-// is not a LIKE wildcard).
-func (r *loadRig) prefixDatabases(t *testing.T) int {
+// prefixDatabases returns every provisioned-prefixed database name in the
+// catalog. Comparing names (not just counts) prevents extra and missing
+// resources from cancelling one another in the accounting delta.
+func (r *loadRig) prefixDatabases(t *testing.T) map[string]struct{} {
 	t.Helper()
-	return r.countCatalog(t, `SELECT count(*) FROM pg_database WHERE datname LIKE $1`, `px\_%`)
+	return r.catalogNames(t, `SELECT datname FROM pg_database WHERE datname LIKE $1`, `px\_%`)
 }
 
-// prefixRoles counts every provisioned-prefixed login role in the catalog.
-func (r *loadRig) prefixRoles(t *testing.T) int {
+// prefixRoles returns every provisioned-prefixed login role in the catalog.
+func (r *loadRig) prefixRoles(t *testing.T) map[string]struct{} {
 	t.Helper()
-	return r.countCatalog(t, `SELECT count(*) FROM pg_roles WHERE rolname LIKE $1`, `pu\_%`)
+	return r.catalogNames(t, `SELECT rolname FROM pg_roles WHERE rolname LIKE $1`, `pu\_%`)
 }
 
-func (r *loadRig) countCatalog(t *testing.T, query, arg string) int {
+func (r *loadRig) catalogNames(t *testing.T, query, arg string) map[string]struct{} {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	var n int
-	if err := r.pool.QueryRow(ctx, query, arg).Scan(&n); err != nil {
-		t.Fatalf("catalog count: %v", err)
+	rows, err := r.pool.Query(ctx, query, arg)
+	if err != nil {
+		t.Fatalf("list managed catalog names: %v", err)
 	}
-	return n
+	defer rows.Close()
+	names := make(map[string]struct{})
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			t.Fatalf("scan managed catalog name: %v", err)
+		}
+		names[name] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate managed catalog names: %v", err)
+	}
+	return names
 }
 
 func (r *loadRig) totalReservations(t *testing.T) int {

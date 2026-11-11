@@ -79,14 +79,12 @@ type report struct {
 	P99 float64 `json:"timeToReadyP99ms"`
 	Max float64 `json:"timeToReadyMaxMs"`
 
-	// External accounting over the provisioned prefixes: how many px_/pu_
-	// resources appeared during the run, and how many of those are not
-	// attributable to one of the run's environments (an orphan — always a
-	// failure). DuplicateResources counts per-environment extras plus
-	// unattributed resources, and must be zero.
+	// External accounting over the provisioned prefixes. Counts are backed by
+	// exact before/after name-set comparisons, not unique-name count(*) queries.
 	CreatedDatabases      int `json:"createdDatabases"`
 	CreatedRoles          int `json:"createdRoles"`
 	UnattributedResources int `json:"unattributedResources"`
+	MissingResources      int `json:"missingResources"`
 	DuplicateResources    int `json:"duplicateResources"`
 }
 
@@ -101,9 +99,8 @@ func TestLoadProfileConcurrentCreation(t *testing.T) {
 	// already on the shared stack plus this run's environments.
 	rig.capacity.Limit = rig.totalReservations(t) + n
 
-	// Snapshot the provisioned prefixes before anything runs: the duplicate
-	// check needs a before/after delta, not per-name counts (those can
-	// structurally never exceed one).
+	// Snapshot exact names before anything runs. Per-name counts are unique by
+	// catalog constraint and cannot detect an extra resource under another name.
 	beforeDatabases := rig.prefixDatabases(t)
 	beforeRoles := rig.prefixRoles(t)
 
@@ -150,22 +147,31 @@ func TestLoadProfileConcurrentCreation(t *testing.T) {
 	}
 	wg.Wait()
 
-	// External truth: count the databases and roles every environment left
-	// behind, then snapshot the prefixes again — the delta is the number of
-	// resources the run created, and every one of them must belong to one of
-	// the run's environments.
+	// External truth: count the expected per-environment resources, then compare
+	// exact prefix-name sets before and after. This detects extra orphan names,
+	// missing expected names, and collisions with a pre-existing name. Counts
+	// alone could hide an extra database offset by a missing role.
+	expectedDatabases, expectedRoles := make(map[string]struct{}, n), make(map[string]struct{}, n)
+	perNameDuplicates := 0
 	for i := range samples {
 		samples[i].DatabaseRows = rig.countDatabase(t, rig.databaseName(samples[i].EnvID))
 		samples[i].RoleRows = rig.countRole(t, rig.roleName(samples[i].EnvID))
+		expectedDatabases[rig.databaseName(samples[i].EnvID)] = struct{}{}
+		expectedRoles[rig.roleName(samples[i].EnvID)] = struct{}{}
+		perNameDuplicates += max(samples[i].DatabaseRows-1, 0) + max(samples[i].RoleRows-1, 0)
 		if samples[i].Ready {
 			samples[i].TimeToReady = samples[i].ReadyAt.Sub(samples[i].CreatedAt)
 			samples[i].TimeToReadyMs = ms(samples[i].TimeToReady)
 		}
 	}
-	createdDatabases := rig.prefixDatabases(t) - beforeDatabases
-	createdRoles := rig.prefixRoles(t) - beforeRoles
+	afterDatabases, afterRoles := rig.prefixDatabases(t), rig.prefixRoles(t)
+	createdDatabases, extraDatabases, missingDatabases := resourceDelta(beforeDatabases, afterDatabases, expectedDatabases)
+	createdRoles, extraRoles, missingRoles := resourceDelta(beforeRoles, afterRoles, expectedRoles)
+	unattributed := extraDatabases + extraRoles
+	missing := missingDatabases + missingRoles
 
-	rep := summarize(started, n, rate, workers, samples, createdDatabases, createdRoles)
+	rep := summarize(started, n, rate, workers, samples,
+		createdDatabases, createdRoles, unattributed, missing, perNameDuplicates)
 	printReport(t, rep, samples)
 
 	// The guarantees.
@@ -173,11 +179,11 @@ func TestLoadProfileConcurrentCreation(t *testing.T) {
 		t.Fatalf("only %d of %d environments became ready", rep.ReadyCount, n)
 	}
 	if rep.UnattributedResources != 0 {
-		t.Fatalf("%d external resources appeared during the run without belonging to one of "+
-			"the run's environments (created %d databases / %d roles, environments hold %d / %d) — "+
-			"an orphaned resource is a leak, never acceptable",
-			rep.UnattributedResources, rep.CreatedDatabases, rep.CreatedRoles,
-			sumRows(samples, true), sumRows(samples, false))
+		t.Fatalf("%d unexpected managed resources appeared during the run (created %d databases / %d roles)",
+			rep.UnattributedResources, rep.CreatedDatabases, rep.CreatedRoles)
+	}
+	if rep.MissingResources != 0 {
+		t.Fatalf("%d expected managed resources were missing from the run's new resource set", rep.MissingResources)
 	}
 	if rep.DuplicateResources != 0 {
 		t.Fatalf("the load run produced %d duplicate external resources — never acceptable",
@@ -198,17 +204,16 @@ func isTerminal(state domain.EnvState) bool {
 	return false
 }
 
-// summarize computes the percentiles and error rate over the samples, and
-// reconciles the per-environment resource counts against the run's
-// before/after prefix deltas. A database or role the run created but no run
-// environment holds is unattributed (an orphan); per-environment counts
-// above one are duplicates. Both must be zero.
+// summarize computes latency/error percentiles and records external catalog
+// discrepancies computed from exact before/after name sets by the caller.
 func summarize(started time.Time, n int, rate float64, workers int, samples []sample,
-	createdDatabases, createdRoles int) report {
+	createdDatabases, createdRoles, unattributed, missing, perNameDuplicates int) report {
 	rep := report{
 		StartedAt: started.Format(time.RFC3339),
 		Envs:      n, RatePerSecond: rate, Workers: workers,
 		CreatedDatabases: createdDatabases, CreatedRoles: createdRoles,
+		UnattributedResources: unattributed, MissingResources: missing,
+		DuplicateResources: unattributed + missing + perNameDuplicates,
 	}
 	durs := make([]float64, 0, len(samples))
 	for i := range samples {
@@ -216,20 +221,7 @@ func summarize(started time.Time, n int, rate float64, workers int, samples []sa
 			rep.ReadyCount++
 			durs = append(durs, samples[i].TimeToReadyMs)
 		}
-		if samples[i].DatabaseRows > 1 {
-			rep.DuplicateResources += samples[i].DatabaseRows - 1
-		}
-		if samples[i].RoleRows > 1 {
-			rep.DuplicateResources += samples[i].RoleRows - 1
-		}
 	}
-	// Attribution: every resource the run created must be held by a run
-	// environment. A negative delta is equally wrong — a pre-existing
-	// resource matching a run environment's name means the deterministic
-	// naming collided with something outside the run.
-	rep.UnattributedResources = (createdDatabases - sumRows(samples, true)) +
-		(createdRoles - sumRows(samples, false))
-	rep.DuplicateResources += max(rep.UnattributedResources, 0)
 	rep.ErrorRate = float64(n-rep.ReadyCount) / float64(n)
 	sort.Float64s(durs)
 	if len(durs) > 0 {
@@ -241,18 +233,46 @@ func summarize(started time.Time, n int, rate float64, workers int, samples []sa
 	return rep
 }
 
-// sumRows totals the per-environment catalog counts (databases when
-// databases is true, roles otherwise).
-func sumRows(samples []sample, databases bool) int {
-	total := 0
-	for i := range samples {
-		if databases {
-			total += samples[i].DatabaseRows
-		} else {
-			total += samples[i].RoleRows
+// resourceDelta compares exact catalog name sets. It returns the number of
+// additions, additions not expected for this run, and expected names that were
+// missing from the delta (absent after the run or already present before it).
+func resourceDelta(before, after, expected map[string]struct{}) (created, unexpected, missing int) {
+	added := make(map[string]struct{})
+	for name := range after {
+		if _, existed := before[name]; existed {
+			continue
+		}
+		added[name] = struct{}{}
+		created++
+		if _, belongs := expected[name]; !belongs {
+			unexpected++
 		}
 	}
-	return total
+	for name := range expected {
+		if _, newlyCreated := added[name]; !newlyCreated {
+			missing++
+		}
+	}
+	return created, unexpected, missing
+}
+
+func TestResourceDeltaDoesNotCancelExtraAndMissingResources(t *testing.T) {
+	set := func(names ...string) map[string]struct{} {
+		out := make(map[string]struct{}, len(names))
+		for _, name := range names {
+			out[name] = struct{}{}
+		}
+		return out
+	}
+	created, unexpected, missing := resourceDelta(
+		set("px-preexisting"),
+		set("px-preexisting", "px-expected-a", "px-orphan"),
+		set("px-expected-a", "px-expected-b"),
+	)
+	if created != 2 || unexpected != 1 || missing != 1 {
+		t.Fatalf("resource delta = created %d / unexpected %d / missing %d; want 2 / 1 / 1",
+			created, unexpected, missing)
+	}
 }
 
 // percentile returns the q-quantile of a sorted slice.
@@ -278,8 +298,8 @@ func printReport(t *testing.T, rep report, samples []sample) {
 		rep.ReadyCount, rep.Envs, rep.ErrorRate*100)
 	fmt.Fprintf(&b, "time-to-ready p50/p95/p99/max: %.0fms / %.0fms / %.0fms / %.0fms\n",
 		rep.P50, rep.P95, rep.P99, rep.Max)
-	fmt.Fprintf(&b, "external accounting: created %d databases / %d roles; %d unattributed\n",
-		rep.CreatedDatabases, rep.CreatedRoles, rep.UnattributedResources)
+	fmt.Fprintf(&b, "external accounting: created %d databases / %d roles; %d unexpected / %d missing\n",
+		rep.CreatedDatabases, rep.CreatedRoles, rep.UnattributedResources, rep.MissingResources)
 	fmt.Fprintf(&b, "duplicate resources: %d (must be 0)\n", rep.DuplicateResources)
 	for _, s := range samples {
 		status := fmt.Sprintf("ready in %.0fms", s.TimeToReadyMs)
