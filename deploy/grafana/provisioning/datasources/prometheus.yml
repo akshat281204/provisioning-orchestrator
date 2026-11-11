@@ -1,0 +1,12 @@
+apiVersion: 1
+
+# Local Grafana datasources: the phase-8 dashboard (deploy/dashboard.json)
+# queries Prometheus, which scrapes both the orchestrator's /metrics and the
+# collector's OTLP metric exporter.
+datasources:
+  - name: Prometheus
+    uid: provisioning-prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
