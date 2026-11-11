@@ -28,6 +28,29 @@ type environmentResponse struct {
 	CredentialRef string `json:"credentialRef,omitempty"`
 	CreatedAt     string `json:"createdAt,omitempty"`
 	UpdatedAt     string `json:"updatedAt,omitempty"`
+	// Timeline is the compact audit trail the workflow appends on every
+	// environment state move ({state, at} pairs, state names only). It is
+	// written by the store JSON-side and carries no free text, so it is
+	// redacted by construction; it is filtered again on the way out.
+	Timeline []timelineView `json:"timeline,omitempty"`
+	// Cleanup carries progress only while a cleanup workflow is underway
+	// (deleting, cancelling, or carrying a failed cleanup step): deletion
+	// is a workflow, and the response must show where it stands.
+	Cleanup *cleanupProgress `json:"cleanup,omitempty"`
+}
+
+// timelineView is one entry of the audit timeline: a state name and the
+// time it was entered. No other field exists on purpose.
+type timelineView struct {
+	State string `json:"state"`
+	At    string `json:"at"`
+}
+
+// cleanupProgress summarises the compensation plan's progress.
+type cleanupProgress struct {
+	Done   int `json:"done"`
+	Total  int `json:"total"`
+	Failed int `json:"failed,omitempty"`
 }
 
 // stepView is one redacted history entry: progress fields plus a scrubbed

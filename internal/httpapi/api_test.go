@@ -44,7 +44,7 @@ func newFakeStore() *fakeStore {
 func keyOf(tenantID, idemKey string) string { return tenantID + "\x00" + idemKey }
 
 func (f *fakeStore) CreateEnvironmentWithPlan(
-	_ context.Context, env domain.Environment, plan []domain.PlannedStep,
+	_ context.Context, env domain.Environment, plan []domain.PlannedStep, traceparent string,
 ) (domain.Environment, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -181,6 +181,69 @@ func (f *fakeStore) envCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return len(f.envs)
+}
+
+// BeginCleanup mirrors the store's durable cleanup move: CAS the state to
+// the target (wrapping ErrIllegalTransition when the machine refuses),
+// append a timeline entry, write the cleanup plan rows exactly once, and
+// re-arm wedged failed cleanup rows.
+func (f *fakeStore) BeginCleanup(_ context.Context, environmentID string, target domain.EnvState) (domain.Environment, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	env, ok := f.envs[environmentID]
+	if !ok {
+		return domain.Environment{}, fmt.Errorf("fake: begin cleanup %s: %w", environmentID, store.ErrNotFound)
+	}
+	if env.State != target {
+		if !env.State.CanTransitionTo(target) {
+			return domain.Environment{}, fmt.Errorf("fake: begin cleanup %s: %w: illegal %q -> %q",
+				environmentID, store.ErrIllegalTransition, env.State, target)
+		}
+		env.State = target
+	}
+	// Re-arm failed cleanup rows: a repeated call is a retry.
+	for i, st := range f.steps[environmentID] {
+		if isCleanupKind(st.Kind) && st.State == domain.StepFailed {
+			f.steps[environmentID][i].State = domain.StepPending
+		}
+	}
+	if len(f.steps[environmentID]) == len(domain.Plan()) {
+		for i, kind := range domain.CleanupPlan {
+			idx := len(domain.Plan()) + i + 1
+			f.steps[environmentID] = append(f.steps[environmentID], domain.Step{
+				ID:            fmt.Sprintf("step-%d", idx),
+				EnvironmentID: environmentID,
+				StepIndex:     idx,
+				Kind:          kind,
+				State:         domain.StepPending,
+				OperationKey:  domain.OperationKey(environmentID, idx, kind),
+			})
+		}
+	}
+	env.Metadata = appendTimelineEntry(env.Metadata, string(target))
+	f.envs[environmentID] = env
+	return env, nil
+}
+
+// appendTimelineEntry appends one {state, at} entry to an environment's
+// metadata timeline, as the store's transitions do.
+func appendTimelineEntry(metadata []byte, states ...string) []byte {
+	type timelineEntry struct {
+		State string `json:"state"`
+		At    string `json:"at"`
+	}
+	var doc struct {
+		Timeline []timelineEntry `json:"timeline"`
+	}
+	if len(metadata) > 0 {
+		_ = json.Unmarshal(metadata, &doc)
+	}
+	now := time.Now().UTC().Format(time.RFC3339)
+	for _, s := range states {
+		doc.Timeline = append(doc.Timeline, timelineEntry{State: s, At: now})
+	}
+	out, _ := json.Marshal(doc)
+	return out
 }
 
 // postCreate posts one environment-creation request. The body is read from
@@ -372,7 +435,7 @@ func TestHistoryReturnsRedactedTimelineOnly(t *testing.T) {
 		// one; neither may reach the response.
 		Metadata: []byte(`{"internalNote":"secret-material-XYZ"}`),
 	}
-	if _, err := fs.CreateEnvironmentWithPlan(context.Background(), env, domain.Plan()); err != nil {
+	if _, err := fs.CreateEnvironmentWithPlan(context.Background(), env, domain.Plan(), ""); err != nil {
 		t.Fatalf("seed env: %v", err)
 	}
 	// A failed step whose last_error is what a driver would emit with the
@@ -442,7 +505,7 @@ func TestGetEnvironmentExposesConnectionFieldsButNeverMetadata(t *testing.T) {
 		// it, with a password-shaped extra key that must never surface.
 		Metadata: []byte(`{"host":"db.internal","database":"app","credentialRef":"oracle/cred/env-m","password":"hunter2"}`),
 	}
-	if _, err := fs.CreateEnvironmentWithPlan(context.Background(), env, domain.Plan()); err != nil {
+	if _, err := fs.CreateEnvironmentWithPlan(context.Background(), env, domain.Plan(), ""); err != nil {
 		t.Fatalf("seed env: %v", err)
 	}
 
@@ -470,7 +533,7 @@ func TestGetEnvironmentWithNoConnectionFieldsOmitsThem(t *testing.T) {
 		State:          domain.EnvPending,
 		IdempotencyKey: "k", Spec: []byte(`{}`), Metadata: []byte(`{}`),
 	}
-	if _, err := fs.CreateEnvironmentWithPlan(context.Background(), env, domain.Plan()); err != nil {
+	if _, err := fs.CreateEnvironmentWithPlan(context.Background(), env, domain.Plan(), ""); err != nil {
 		t.Fatalf("seed env: %v", err)
 	}
 
@@ -565,6 +628,189 @@ func TestReplayNumericAndNestedSpecEquality(t *testing.T) {
 	}
 	if rec := postCreate(t, a, `{"tenantId":"t1","name":"db","spec":{"limits":{"cpu":4,"mem":4096},"tags":["a","b"]}}`, "key-nested"); rec.Code != http.StatusConflict {
 		t.Fatalf("a genuinely different nested value must be 409, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// acquireEnv seeds one environment with the given state through the fake
+// store's create path, then moves it if needed.
+func acquireEnv(t *testing.T, fs *fakeStore, state domain.EnvState) string {
+	t.Helper()
+	env := domain.Environment{
+		ID: "77777777-8888-4999-a000-bbbbbbbbbbbb", TenantID: "t1", Name: "n",
+		State:          state,
+		IdempotencyKey: "k-" + string(state), Spec: []byte(`{}`), Metadata: []byte(`{}`),
+	}
+	if _, err := fs.CreateEnvironmentWithPlan(context.Background(), env, domain.Plan(), ""); err != nil {
+		t.Fatalf("seed env: %v", err)
+	}
+	return env.ID
+}
+
+// TestCancelAndDeleteReturnAcceptedAndRecordCleanupRows pins the phase-7
+// endpoints: cancel answers 202 with status cancelling, DELETE answers 202
+// with status deleting, both durably record the compensation step rows, and
+// both carry the audit timeline. A repeated DELETE stays 202 (idempotent).
+func TestCancelAndDeleteReturnAcceptedAndRecordCleanupRows(t *testing.T) {
+	cases := []struct {
+		name, method, path string
+		seed, want         domain.EnvState
+	}{
+		{"cancel", http.MethodPost, "/environments/%s/cancel", domain.EnvProvisioning, domain.EnvCancelling},
+		{"delete", http.MethodDelete, "/environments/%s", domain.EnvReady, domain.EnvDeleting},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fs := newFakeStore()
+			a := New(fs)
+			id := acquireEnv(t, fs, tc.seed)
+
+			req := httptest.NewRequest(tc.method, fmt.Sprintf(tc.path, id), nil)
+			rec := httptest.NewRecorder()
+			a.Handler().ServeHTTP(rec, req)
+			if rec.Code != http.StatusAccepted {
+				t.Fatalf("expected 202, got %d: %s", rec.Code, rec.Body.String())
+			}
+			var resp environmentResponse
+			if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+				t.Fatalf("decode response: %v", err)
+			}
+			if resp.Status != string(tc.want) {
+				t.Fatalf("status = %q, want %q (body: %s)", resp.Status, tc.want, rec.Body.String())
+			}
+			if len(resp.Timeline) == 0 {
+				t.Fatal("the response must carry the audit timeline")
+			}
+			fs.mu.Lock()
+			steps := fs.steps[id]
+			fs.mu.Unlock()
+			if len(steps) != len(domain.Plan())+len(domain.CleanupPlan) {
+				t.Fatalf("cleanup plan must be durably recorded, got %d step rows", len(steps))
+			}
+			for _, st := range steps[len(domain.Plan()):] {
+				if st.State != domain.StepPending {
+					t.Fatalf("a cleanup row must start pending: %+v", st)
+				}
+			}
+		})
+	}
+
+	// A repeated DELETE stays 202 — it re-arms wedged rows, never errors.
+	fs := newFakeStore()
+	a := New(fs)
+	id := acquireEnv(t, fs, domain.EnvReady)
+	for i := 0; i < 2; i++ {
+		rec := httptest.NewRecorder()
+		a.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodDelete, "/environments/"+id, nil))
+		if rec.Code != http.StatusAccepted {
+			t.Fatalf("repeated DELETE #%d must stay 202, got %d: %s", i+1, rec.Code, rec.Body.String())
+		}
+	}
+}
+
+// TestCancelAndDeleteMapStateMachinesFailures pins the error mapping: an
+// unknown id is a 404, and a cleanup move the state machine refuses (a
+// ready environment cannot be cancelled; a deleted one cannot be deleted
+// again) is a 409 with the JSON error envelope.
+func TestCancelAndDeleteMapStateMachinesFailures(t *testing.T) {
+	fs := newFakeStore()
+	a := New(fs)
+
+	rec := httptest.NewRecorder()
+	a.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodDelete,
+		"/environments/"+validMissingUUID, nil))
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("DELETE of an unknown environment must be 404, got %d", rec.Code)
+	}
+
+	readyID := acquireEnv(t, fs, domain.EnvReady)
+	rec = httptest.NewRecorder()
+	a.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/environments/"+readyID+"/cancel", nil))
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("cancel of a ready environment must be 409, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	deletedID := acquireEnv(t, fs, domain.EnvRollingBack)
+	fs.mu.Lock()
+	env := fs.envs[deletedID]
+	env.State = domain.EnvDeleted
+	fs.envs[deletedID] = env
+	fs.mu.Unlock()
+	rec = httptest.NewRecorder()
+	a.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodDelete, "/environments/"+deletedID, nil))
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("_DELETE of a deleted environment must be 409, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestGetEnvironmentReportsDeletionProgress pins the deletion contract:
+// while the compensation plan is mid-flight the environment reports
+// `deleting` with its progress, and `deleted` only once every row is done —
+// never earlier.
+func TestGetEnvironmentReportsDeletionProgress(t *testing.T) {
+	fs := newFakeStore()
+	a := New(fs)
+	id := acquireEnv(t, fs, domain.EnvReady)
+
+	if rec := httptest.NewRecorder(); rec != nil {
+		a.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodDelete, "/environments/"+id, nil))
+		if rec.Code != http.StatusAccepted {
+			t.Fatalf("DELETE: expected 202, got %d", rec.Code)
+		}
+	}
+
+	read := func() environmentResponse {
+		rec := httptest.NewRecorder()
+		a.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/environments/"+id, nil))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("GET: expected 200, got %d: %s", rec.Code, rec.Body.String())
+		}
+		var resp environmentResponse
+		_ = json.Unmarshal(rec.Body.Bytes(), &resp)
+		return resp
+	}
+
+	mid := read()
+	if mid.Status != string(domain.EnvDeleting) || mid.Cleanup == nil {
+		t.Fatalf("mid-cleanup must report deleting with progress: %+v", mid)
+	}
+	if mid.Cleanup.Done != 0 || mid.Cleanup.Total != len(domain.CleanupPlan) {
+		t.Fatalf("unexpected mid-cleanup progress: %+v", mid.Cleanup)
+	}
+
+	// Every cleanup row done → the finalizer (the worker's job, mimicked
+	// here) closes the workflow and the environment is finally deleted.
+	fs.mu.Lock()
+	for i, st := range fs.steps[id] {
+		if isCleanupKind(st.Kind) {
+			fs.steps[id][i].State = domain.StepDone
+		}
+	}
+	env := fs.envs[id]
+	env.State = domain.EnvDeleted
+	fs.envs[id] = env
+	fs.mu.Unlock()
+	final := read()
+	if final.Status != string(domain.EnvDeleted) {
+		t.Fatalf("only a complete cleanup may report deleted, got %q", final.Status)
+	}
+	if final.Cleanup == nil || final.Cleanup.Done != len(domain.CleanupPlan) {
+		t.Fatalf("a deleted environment must show the complete plan: %+v", final.Cleanup)
+	}
+
+	// One wedged cleanup step → failed, visible, never deleted.
+	fs.mu.Lock()
+	for i, st := range fs.steps[id] {
+		if isCleanupKind(st.Kind) {
+			fs.steps[id][i].State = domain.StepFailed
+		}
+	}
+	env = fs.envs[id]
+	env.State = domain.EnvFailed
+	fs.envs[id] = env
+	fs.mu.Unlock()
+	fp := read()
+	if fp.Status != string(domain.EnvFailed) || fp.Cleanup == nil || fp.Cleanup.Failed == 0 {
+		t.Fatalf("a wedged cleanup must surface failed rows: %+v", fp)
 	}
 }
 

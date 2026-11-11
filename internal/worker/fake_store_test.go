@@ -26,6 +26,21 @@ type fakeStore struct {
 	completions   []domain.Step
 	releases      []string
 	errNoWorkSeen int
+	// inDoubtClaims records reconciliation claims; retrySchedules and
+	// envEvents record the phase-7 bookkeeping calls.
+	inDoubtClaims []string
+	retryBackoffs []time.Duration
+	// cleanupEnvIDs seeds ListCleanupEnvironments for sweep tests.
+	cleanupEnvIDs []string
+	// envEvents records MarkEnvironmentInDoubt / FinalizeCleanup call
+	// names per environment, call order preserved.
+	envEvents []fakeEnvEvent
+}
+
+type fakeEnvEvent struct {
+	EnvironmentID string
+	Event         string
+	StepIndex     int
 }
 
 // leaseLayout keeps millisecond precision on the wire: the time.RFC3339
@@ -59,17 +74,47 @@ func newFakeStore(now func() time.Time, steps ...domain.Step) *fakeStore {
 func (f *fakeStore) claimableID() int {
 	now := f.clock().UTC()
 	for i, s := range f.steps {
+		claimable := false
 		switch {
 		case s.State == domain.StepPending:
-			return i
+			claimable = true
 		case s.State == domain.StepRunning && s.LeaseExpiresAt != "":
 			exp, err := parseLease(s.LeaseExpiresAt)
 			if err == nil && exp.Before(now) {
-				return i
+				claimable = true
 			}
 		}
+		if !claimable {
+			continue
+		}
+		// Forward rows for one environment are strictly sequential. A later
+		// row cannot become work while any lower-indexed forward row is not
+		// done, matching the Postgres claim predicate.
+		if s.EnvironmentID != "" && !isCleanupStep(s.Kind) {
+			blocked := false
+			for _, prev := range f.steps {
+				if prev.EnvironmentID == s.EnvironmentID && prev.StepIndex < s.StepIndex &&
+					!isCleanupStep(prev.Kind) && prev.State != domain.StepDone {
+					blocked = true
+					break
+				}
+			}
+			if blocked {
+				continue
+			}
+		}
+		return i
 	}
 	return -1
+}
+
+func isCleanupStep(kind domain.StepKind) bool {
+	for _, cleanup := range domain.CleanupPlan {
+		if cleanup == kind {
+			return true
+		}
+	}
+	return false
 }
 
 // ClaimNextStep claims the oldest claimable step exactly as the SQL does.
@@ -87,6 +132,7 @@ func (f *fakeStore) ClaimNextStep(_ context.Context, owner string, lease time.Du
 		return domain.Step{}, fmt.Errorf("fake store: %w", store.ErrNoWork)
 	}
 	s := f.steps[idx]
+	s.Reclaimed = s.State == domain.StepRunning // pre-claim running ⇒ expired lease
 	s.State = domain.StepRunning
 	s.LeaseOwner = owner
 	s.Attempts++
@@ -143,6 +189,158 @@ func (f *fakeStore) CompleteStep(_ context.Context, stepID, owner string, state 
 // simply records the completion like CompleteStep does for a done step.
 func (f *fakeStore) CompleteVerification(ctx context.Context, stepID, owner, _ string) error {
 	return f.CompleteStep(ctx, stepID, owner, domain.StepDone, "")
+}
+
+// ClaimNextInDoubtStep claims the oldest in_doubt step for owner by taking
+// the reconciliation lease WITHOUT changing the state — the row stays
+// in_doubt until an outcome is recorded, exactly as the SQL does. A claim
+// whose lease expired is reclaimable; a live claim is not. The ordinary
+// claimable query never returns an in_doubt row, which the fake mirrors
+// structurally.
+func (f *fakeStore) ClaimNextInDoubtStep(_ context.Context, owner string) (domain.Step, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for i, s := range f.steps {
+		if s.State != domain.StepInDoubt {
+			continue
+		}
+		if s.LeaseOwner != "" && s.LeaseExpiresAt != "" {
+			exp, err := parseLease(s.LeaseExpiresAt)
+			if err != nil || !exp.Before(f.clock().UTC()) {
+				continue // held by a live (or unreadable) reconciliation claim
+			}
+		}
+		s.LeaseOwner = owner
+		s.LeaseExpiresAt = formatLease(f.clock().UTC().Add(inDoubtLease))
+		f.steps[i] = s
+		f.inDoubtClaims = append(f.inDoubtClaims, s.ID)
+		return s, nil
+	}
+	f.errNoWorkSeen++
+	return domain.Step{}, fmt.Errorf("fake store: %w", store.ErrNoWork)
+}
+
+// RecordReconcileOutcome records the reconciler's verdict on a held
+// ambiguous row — the state is already recorded as `in_doubt`, so the owner
+// guard is state in (in_doubt) AND lease_owner = owner, mirroring the SQL.
+// For any verdict other than in_doubt the fake also books the environment
+// resume, because the real store's verdict transaction carries it: there is
+// no separate ResumeFromInDoubt call the worker could crash between.
+func (f *fakeStore) RecordReconcileOutcome(_ context.Context, stepID, owner string, state domain.StepState, lastErr string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for i, s := range f.steps {
+		if s.ID != stepID {
+			continue
+		}
+		if s.State != domain.StepInDoubt || s.LeaseOwner != owner {
+			return fmt.Errorf("fake store: record reconcile outcome %s for %s: %w", stepID, owner, store.ErrNotFound)
+		}
+		s.State = state
+		s.LastError = lastErr
+		if state != domain.StepInDoubt {
+			s.LeaseOwner = ""
+			s.LeaseExpiresAt = ""
+			f.envEvents = append(f.envEvents, fakeEnvEvent{s.EnvironmentID, "resume", s.StepIndex})
+		}
+		f.steps[i] = s
+		f.completions = append(f.completions, s)
+		return nil
+	}
+	return fmt.Errorf("fake store: record reconcile outcome %s: %w", stepID, store.ErrNotFound)
+}
+
+// ReapExpiredReconciliations clears the leases of abandoned reconciliation
+// claims, returning rows claimable by the next pass; the rows stay in_doubt.
+func (f *fakeStore) ReapExpiredReconciliations(_ context.Context) (int64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var n int64
+	now := f.clock().UTC()
+	for i, s := range f.steps {
+		if s.State != domain.StepInDoubt || s.LeaseOwner == "" || s.LeaseExpiresAt == "" {
+			continue
+		}
+		if exp, err := parseLease(s.LeaseExpiresAt); err == nil && exp.Before(now) {
+			s.LeaseOwner = ""
+			s.LeaseExpiresAt = ""
+			f.steps[i] = s
+			n++
+		}
+	}
+	return n, nil
+}
+
+// ListCleanupEnvironments is backed by an optional environment-state map the
+// tests seed; unsynced (polling tests not exercising the sweep) it finds
+// nothing.
+func (f *fakeStore) ListCleanupEnvironments(_ context.Context) ([]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.cleanupEnvIDs, nil
+}
+
+// ListFailedSteps returns the failed rows the sweep may re-schedule.
+func (f *fakeStore) ListFailedSteps(context.Context) ([]domain.Step, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []domain.Step
+	for _, s := range f.steps {
+		if s.State == domain.StepFailed && s.LeaseOwner == "" {
+			out = append(out, s)
+		}
+	}
+	return out, nil
+}
+
+// inDoubtLease mirrors the store's reconciliation lease.
+const inDoubtLease = 60 * time.Second
+
+// ScheduleRetry returns a failed step to pending with its backoff lease
+// recorded; the fake keeps the delay only for assertions — its claim path
+// is deliberately simple and re-claims pending rows immediately.
+func (f *fakeStore) ScheduleRetry(_ context.Context, stepID string, delay time.Duration) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for i, s := range f.steps {
+		if s.ID != stepID {
+			continue
+		}
+		if s.State != domain.StepFailed {
+			return fmt.Errorf("fake store: schedule retry %s: state %s, want failed: %w",
+				stepID, s.State, store.ErrNotFound)
+		}
+		s.State = domain.StepPending
+		s.LeaseOwner = ""
+		s.LeaseExpiresAt = ""
+		f.steps[i] = s
+		f.retryBackoffs = append(f.retryBackoffs, delay)
+		f.envEvents = append(f.envEvents, fakeEnvEvent{s.EnvironmentID, "schedule_retry", 0})
+		return nil
+	}
+	return fmt.Errorf("fake store: schedule retry %s: %w", stepID, store.ErrNotFound)
+}
+
+// MarkEnvironmentInDoubt and FinalizeCleanup are booked as events: the fake
+// as events: the fake has no environment table, so tests assert on the
+// calls the worker made.
+func (f *fakeStore) MarkEnvironmentInDoubt(_ context.Context, environmentID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, cleanupID := range f.cleanupEnvIDs {
+		if cleanupID == environmentID {
+			return nil // cleanup state owns this environment; do not hide it
+		}
+	}
+	f.envEvents = append(f.envEvents, fakeEnvEvent{environmentID, "in_doubt", 0})
+	return nil
+}
+
+func (f *fakeStore) FinalizeCleanup(_ context.Context, environmentID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.envEvents = append(f.envEvents, fakeEnvEvent{environmentID, "finalize", 0})
+	return nil
 }
 
 // ReleaseStep returns a held step to pending; not holding it is a no-op.
