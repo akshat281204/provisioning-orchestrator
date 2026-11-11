@@ -25,6 +25,21 @@ test: ## Run unit tests (no external services required)
 test-integration: ## Run tests that need docker-compose up
 	$(GO) test -p 1 -race -count=1 -tags=integration ./...
 
+.PHONY: check-stack
+check-stack: ## Fail early when the compose stack is down (guards integration targets)
+	@if [ -z "$${TEST_DATABASE_URL:-}" ] && [ -z "$$(docker compose ps -q postgres 2>/dev/null)" ]; then \
+		echo "postgres is not running — run \`make up\` first (or set TEST_DATABASE_URL)" >&2; exit 1; fi
+	@if [ -z "$${TEST_VAULT_ADDR:-}" ] && ! nc -z localhost 8200 2>/dev/null; then \
+		echo "vault is not reachable on :8200 — run \`make up\` first (or set TEST_VAULT_ADDR)" >&2; exit 1; fi
+
+.PHONY: test-faults
+test-faults: check-stack ## Run the ten fault-injection scenarios (needs docker-compose up)
+	$(GO) test -p 1 -race -count=1 -tags=integration ./test/faults
+
+.PHONY: load
+load: check-stack ## Run the load profile: concurrent creation + time-to-ready report (needs docker-compose up)
+	$(GO) test -p 1 -count=1 -tags=integration ./test/load
+
 .PHONY: vet
 vet: ## go vet
 	$(GO) vet ./...
@@ -68,6 +83,10 @@ migrate: ## Apply embedded SQL migrations to the configured database
 .PHONY: demo
 demo: ## Run the end-to-end failure-recovery demo (see scripts/failure-recovery-demo.sh)
 	bash scripts/failure-recovery-demo.sh
+
+.PHONY: benchmark
+benchmark: ## Run the benchmark: load profile + recorded environment context (see scripts/benchmark.sh)
+	bash scripts/benchmark.sh
 
 .PHONY: logs
 logs: ## Tail the local stack
