@@ -94,6 +94,12 @@ make benchmark   # the load profile plus recorded environment context
 make down        # tear down and delete volumes
 ```
 
+Latest recorded local load run: **16/16 environments ready at 4 creates/s with
+4 workers**, p50 **160 ms**, p95/p99 **368 ms**, and **0 unexpected or missing
+database/role resources**. These are measurements on one 10-core Apple Silicon
+host with colocated Postgres 16.15 and dev-mode Vault; see
+[`docs/evaluation.md`](docs/evaluation.md) for methodology and limitations.
+
 ## Status
 
 What is built today (every claim below is backed by a command; see

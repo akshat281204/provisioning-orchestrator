@@ -73,25 +73,33 @@ postgres:        server_version 16.15, shared_buffers 128MB, fsync on,
 vault:           dev-mode container at http://127.0.0.1:8200
 ```
 
-| Metric | Run 1 | Run 2 |
-| --- | --- | --- |
-| Environments created | 16 at 4.0/s, 4 workers | 16 at 4.0/s, 4 workers |
-| Ready rate | 16/16 (error rate 0%) | 16/16 (error rate 0%) |
-| Time-to-ready p50 | ~162 ms | ~162 ms |
-| Time-to-ready p95 | ~318 ms | ~318 ms |
-| Time-to-ready p99 | ~318 ms | ~318 ms |
-| Created databases / roles | 16 / 16, 0 unattributed | 16 / 16, 0 unattributed |
-| Duplicate external resources | **0** | **0** |
+Run 3 was recorded against commit `83e363b` on 2026-11-11. Its full context,
+JSON report, and console output are in the generated `benchmark-results/`
+artifacts for that run; rerun `make benchmark` to produce artifacts for the
+current checkout.
+
+| Metric | Run 1 | Run 2 | Run 3 |
+| --- | --- | --- | --- |
+| Environments created | 16 at 4.0/s, 4 workers | 16 at 4.0/s, 4 workers | 16 at 4.0/s, 4 workers |
+| Ready rate | 16/16 (error rate 0%) | 16/16 (error rate 0%) | 16/16 (error rate 0%) |
+| Time-to-ready p50 | ~162 ms | ~162 ms | 160 ms |
+| Time-to-ready p95 | ~318 ms | ~318 ms | 368 ms |
+| Time-to-ready p99 | ~318 ms | ~318 ms | 368 ms |
+| Created databases / roles | 16 / 16, 0 unattributed | 16 / 16, 0 unattributed | 16 / 16, 0 unexpected, 0 missing |
+| Duplicate external resources | **0** | **0** | **0** |
 
 The duplicate count is the assertion that matters, and its method is worth
 stating because a naive version cannot fail: database and role names are
 deterministic per environment and UNIQUE in the catalogs, so counting by
 name always returns 0 or 1 no matter what the system did. Instead the run
-snapshots every provisioned-prefixed resource (`px_%` databases, `pu_%`
-roles) before and after, requires the created delta to equal the number of
-resources the run's environments hold, and counts per-environment counts
-above one as duplicates. A resource created during the run that no run
-environment holds — the classic crash-mid-create orphan — fails the run.
+snapshots the exact names of every provisioned-prefixed resource (`px_%`
+databases, `pu_%` roles) before and after, then compares the added-name sets
+with the deterministic expected names for this run. It reports unexpected and
+missing names separately, so an extra resource cannot be hidden by a missing
+one in a net count. Per-name counts are retained only as existence checks; a
+unit test proves an extra and a missing name cannot cancel each other. A
+resource created during the run that no run environment holds — the classic
+crash-mid-create orphan — fails the run.
 Every step is at-least-once executed and idempotent, so a duplicate or
 orphan under concurrency must be impossible; the load run is where that
 claim is exercised, not asserted from reading the code.
