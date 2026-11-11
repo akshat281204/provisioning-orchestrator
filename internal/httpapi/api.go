@@ -39,6 +39,13 @@ type Store interface {
 	// ListForEnvironment returns the steps ordered by index.
 	ListForEnvironment(ctx context.Context, environmentID string) ([]domain.Step, error)
 
+	// BeginCleanup starts the durable cleanup workflow: it moves the
+	// environment to `target` (cancelling or deleting) and writes the
+	// compensation step rows in one transaction, re-arming wedged cleanup
+	// rows on a repeat call. Illegal moves wrap store.ErrIllegalTransition;
+	// missing ids wrap store.ErrNotFound.
+	BeginCleanup(ctx context.Context, environmentID string, target domain.EnvState) (domain.Environment, error)
+
 	// TransitionEnvironment CAS-moves the environment's state (the
 	// credential/rotation path only; `ready` is rejected at the store).
 	TransitionEnvironment(ctx context.Context, environmentID string, target domain.EnvState) error
@@ -82,6 +89,8 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("POST /environments", a.createEnvironment)
 	mux.HandleFunc("GET /environments/{id}", a.getEnvironment)
 	mux.HandleFunc("GET /environments/{id}/history", a.getHistory)
+	mux.HandleFunc("POST /environments/{id}/cancel", a.cancelEnvironment)
+	mux.HandleFunc("DELETE /environments/{id}", a.deleteEnvironment)
 	mux.HandleFunc("POST /environments/{id}/credentials", a.retrieveCredentials)
 	mux.HandleFunc("POST /environments/{id}/rotate", a.rotateEnvironment)
 	return mux
@@ -175,15 +184,32 @@ func (a *API) replay(w http.ResponseWriter, existing domain.Environment, req cre
 	writeEnv(w, http.StatusOK, existing, true)
 }
 
-// getEnvironment handles GET /v1/environments/{id}: status and non-secret
-// connection metadata, never credential material.
+// getEnvironment handles GET /v1/environments/{id}: status, non-secret
+// connection metadata, and — while a cleanup workflow is underway — its
+// progress. Credential material is never a field of the response.
 func (a *API) getEnvironment(w http.ResponseWriter, r *http.Request) {
 	envID, ok := environmentIDFromPath(w, r)
 	if !ok {
 		return
 	}
 	env, err := a.envs.Get(r.Context(), envID)
-	writeEnvironmentOrError(w, env, err)
+	if err != nil {
+		writeEnvironmentOrError(w, env, err)
+		return
+	}
+	// Progress needs the step rows; they are fetched only for the states
+	// where the compensation plan can exist, so a plain read of a pending
+	// environment stays a single-row read.
+	var steps []domain.Step
+	if needsCleanupProgress(env.State) {
+		steps, err = a.envs.ListForEnvironment(r.Context(), envID)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "internal_error",
+				"reading the workflow steps failed")
+			return
+		}
+	}
+	writeEnvironment(w, http.StatusOK, env, false, steps)
 }
 
 // writeEnvironmentOrError maps a store lookup result onto the response. It is
@@ -251,6 +277,45 @@ func (a *API) getHistory(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
+// cancelEnvironment handles POST /v1/environments/{id}/cancel: stop
+// scheduling new steps. It begins the durable cancelling workflow (202) —
+// in-flight steps are allowed to finish or expire, cleanup rows are already
+// recorded, and the finalizer closes the workflow once they conclude.
+func (a *API) cancelEnvironment(w http.ResponseWriter, r *http.Request) {
+	a.beginCleanup(w, r, domain.EnvCancelling)
+}
+
+// deleteEnvironment handles DELETE /v1/environments/{id}: begin the durable
+// cleanup (a `deleting` state with compensation rows). It answers 202; the
+// environment reports deleted only when every cleanup step is done — until
+// then GET keeps reporting deleting with progress.
+func (a *API) deleteEnvironment(w http.ResponseWriter, r *http.Request) {
+	a.beginCleanup(w, r, domain.EnvDeleting)
+}
+
+// beginCleanup is the shared body of cancel and delete: it asks the store
+// for the durable cleanup move and maps the failure modes. A repeated call
+// (a retried DELETE) is the store's idempotency problem and re-answers 202.
+func (a *API) beginCleanup(w http.ResponseWriter, r *http.Request, target domain.EnvState) {
+	envID, ok := environmentIDFromPath(w, r)
+	if !ok {
+		return
+	}
+	env, err := a.envs.BeginCleanup(r.Context(), envID, target)
+	switch {
+	case errors.Is(err, store.ErrNotFound):
+		writeError(w, http.StatusNotFound, "not_found", "no such environment")
+	case errors.Is(err, store.ErrIllegalTransition):
+		writeError(w, http.StatusConflict, "illegal_state",
+			"the environment cannot be cleaned from its current state")
+	case err != nil:
+		writeError(w, http.StatusInternalServerError, "internal_error",
+			"starting the cleanup workflow failed")
+	default:
+		writeEnv(w, http.StatusAccepted, env, false)
+	}
+}
+
 // uuidPattern accepts the canonical 8-4-4-4-12 hexadecimal form that both
 // newEnvironmentID produces and the environment_id uuid column accepts.
 var uuidPattern = regexp.MustCompile(
@@ -270,11 +335,18 @@ func environmentIDFromPath(w http.ResponseWriter, r *http.Request) (string, bool
 	return id, true
 }
 
-// writeEnv renders an environment as its wire shape, deriving the redacted
-// connection fields from persisted metadata. Only the whitelisted keys are
-// read out; anything else in metadata (credential material above all) is
-// never copied into a response.
+// writeEnv renders an environment without step rows (create/replay paths).
 func writeEnv(w http.ResponseWriter, status int, env domain.Environment, withStatusURL bool) {
+	writeEnvironment(w, status, env, withStatusURL, nil)
+}
+
+// writeEnvironment renders an environment as its wire shape, deriving the
+// redacted connection fields from persisted metadata, the {state, at} audit
+// timeline from metadata, and the compensation plan's progress from the
+// step rows (when supplied). Only the whitelisted metadata keys are read
+// out; anything else in metadata (credential material above all) is never
+// copied into a response.
+func writeEnvironment(w http.ResponseWriter, status int, env domain.Environment, withStatusURL bool, steps []domain.Step) {
 	resp := environmentResponse{
 		EnvironmentID: env.ID,
 		Status:        string(env.State),
@@ -296,7 +368,89 @@ func writeEnv(w http.ResponseWriter, status int, env domain.Environment, withSta
 		resp.Database = meta.Database
 		resp.CredentialRef = meta.CredentialRef
 	}
+	resp.Timeline = timelineFromMetadata(env.Metadata)
+	if needsCleanupProgress(env.State) {
+		resp.Cleanup = cleanupProgressOf(env.State, steps)
+	}
 	writeJSON(w, status, resp)
+}
+
+// needsCleanupProgress reports whether the response should show the
+// compensation plan's progress: only environments on a cleanup path (or
+// carrying cleanup failure) hold cleanup rows.
+func needsCleanupProgress(state domain.EnvState) bool {
+	switch state {
+	case domain.EnvDeleting, domain.EnvCancelling, domain.EnvFailed,
+		domain.EnvDeleted, domain.EnvCancelled:
+		return true
+	}
+	return false
+}
+
+// timelineFromMetadata extracts the store-written {state, at} audit entries
+// from an environment's metadata. The entries are state names and
+// timestamps by construction, but the extraction still filters every entry
+// through the redaction rules so the response can never regress into
+// shipping free text if the shape ever changes.
+func timelineFromMetadata(metadata []byte) []timelineView {
+	var doc struct {
+		Timeline []struct {
+			State string `json:"state"`
+			At    string `json:"at"`
+		} `json:"timeline"`
+	}
+	if err := json.Unmarshal(metadata, &doc); err != nil {
+		return nil
+	}
+	if len(doc.Timeline) == 0 {
+		return nil
+	}
+	out := make([]timelineView, 0, len(doc.Timeline))
+	for _, e := range doc.Timeline {
+		out = append(out, timelineView{State: redactText(e.State), At: redactText(e.At)})
+	}
+	return out
+}
+
+// cleanupProgressOf summarises an environment's compensation plan from its
+// step rows. It is rendered only for environments on a cleanup path (or
+// carrying its failure): everywhere else the field would claim meaning it
+// does not have. A nil return omits the field.
+func cleanupProgressOf(state domain.EnvState, steps []domain.Step) *cleanupProgress {
+	switch state {
+	case domain.EnvDeleting, domain.EnvCancelling, domain.EnvDeleted, domain.EnvCancelled,
+		domain.EnvFailed:
+	default:
+		return nil
+	}
+	var done, failed, total int
+	for _, st := range steps {
+		switch {
+		case isCleanupKind(st.Kind):
+			total++
+			switch st.State {
+			case domain.StepDone:
+				done++
+			case domain.StepFailed:
+				failed++
+			}
+		}
+	}
+	if total == 0 {
+		return nil
+	}
+	return &cleanupProgress{Done: done, Total: total, Failed: failed}
+}
+
+// isCleanupKind reports whether the step kind belongs to the compensation
+// plan (drop_database, drop_role, delete_secret, release_capacity).
+func isCleanupKind(kind domain.StepKind) bool {
+	for _, k := range domain.CleanupPlan {
+		if k == kind {
+			return true
+		}
+	}
+	return false
 }
 
 // writeError is the central error mapper: every non-2xx body is the same

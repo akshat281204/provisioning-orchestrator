@@ -29,6 +29,17 @@ import (
 // before it is replaced with a generated id.
 const maxRequestIDLen = 64
 
+// Retry and reconciliation bounds for the production pool: a failed step is
+// retried up to maxStepAttempts leases burned (row-counted, so a restart
+// inherits the same budget), with exponential backoff capped at
+// retryMaxBackoff, and in_doubt steps are re-asked every reconcileInterval.
+const (
+	maxStepAttempts   = 5
+	retryBaseBackoff  = 2 * time.Second
+	retryMaxBackoff   = 30 * time.Second
+	reconcileInterval = 15 * time.Second
+)
+
 // newWorkerPool builds the lease pool and its real executor. The Postgres
 // adapters share the app's pool and drive their DDL with the same
 // credentials; Vault holds the provisioned credentials under its default
@@ -50,6 +61,25 @@ func newWorkerPool(
 		LeaseDuration: cfg.LeaseDuration,
 		StepTimeout:   cfg.StepTimeout,
 		Store:         st,
+		// Reconciliation of in_doubt steps: the read-only probes ask the
+		// same adapters the executor drives, minus every mutating call,
+		// so "looking" can never become "doing".
+		Reconciler: &adapters.Reconciler{
+			Capacity:  capacity,
+			Databases: databases,
+			Roles:     roles,
+			Secrets:   secrets,
+			Log:       log,
+		},
+		// Startup pass runs a fresh pass every interval; the default pick
+		// keeps a dead worker's ambiguity visible for at most a minute or
+		// so without churning the database.
+		RetryPolicy: worker.RetryPolicy{
+			MaxAttempts: maxStepAttempts,
+			BaseBackoff: retryBaseBackoff,
+			MaxBackoff:  retryMaxBackoff,
+		},
+		ReconcileInterval: reconcileInterval,
 		Executor: &worker.AdapterExecutor{
 			Capacity:  capacity,
 			Databases: databases,
