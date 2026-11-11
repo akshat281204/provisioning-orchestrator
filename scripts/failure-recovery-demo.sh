@@ -29,12 +29,15 @@ export PG_HOST_PORT
 # after the kill. The lease must exceed the step timeout (config.Validate).
 DEMO_STEP_TIMEOUT="3s"
 DEMO_LEASE_DURATION="5s"
+DEMO_STEP_PAUSE="750ms"
 LOG_FILE="$(mktemp -t orchestrator-demo-log)"
 ORCH_PID=""
 ORCH_PID_FILE=""
+WATCH_PID=""
 
 cleanup() {
-  local code=$?
+  # The caller's status, saved before cleanup_watch can clobber $?.
+  local code=${1:-$?}
   if [[ -n "$ORCH_PID" ]]; then
     kill "$ORCH_PID" 2>/dev/null || true
     wait "$ORCH_PID" 2>/dev/null || true
@@ -45,7 +48,17 @@ cleanup() {
     tail -40 "$LOG_FILE" >&2 || true
   fi
 }
-trap cleanup EXIT
+
+cleanup_watch() {
+  if [[ -n "$WATCH_PID" ]]; then
+    kill "$WATCH_PID" 2>/dev/null || true
+    wait "$WATCH_PID" 2>/dev/null || true
+  fi
+}
+
+# One trap, and it saves $? before any cleanup function runs, so a failed
+# run still prints the orchestrator log tail.
+trap 'code=$?; cleanup_watch; cleanup "$code"' EXIT
 
 stepn() { echo; echo "── $1 ──"; }
 fail() { echo "FAIL: $*" >&2; exit 1; }
@@ -96,15 +109,14 @@ resource_name() { # prefix env_id
   echo "${1}_${2:0:28}_${hash}"
 }
 
-metrics_counter() { # metric_name — current summed value of a counter on /metrics
-  curl -fsS "$API_BASE/metrics" 2>/dev/null |
-    awk -v m="$1" '$1 == m || index($1, m"{") == 1 { sum += $2 } END { print sum + 0 }'
-}
-
 start_orchestrator() {
   (
     export OTEL_EXPORTER_OTLP_ENDPOINT=localhost:4317
     export STEP_TIMEOUT="$DEMO_STEP_TIMEOUT" LEASE_DURATION="$DEMO_LEASE_DURATION"
+    # Deterministic interception: the verify step holds its running window
+    # for at least the pause, so the watcher sees a live lease and the
+    # kill lands mid-flight instead of racing the fast workflow.
+    export STEP_PAUSE="$DEMO_STEP_PAUSE" STEP_PAUSE_KINDS=verify_usable
     exec ./bin/orchestrator
   ) >>"$LOG_FILE" 2>&1 &
   ORCH_PID=$!
@@ -170,27 +182,32 @@ echo "provisioned role $CREDS_USER queried $CREDS_DB successfully"
 
 stepn "4/7 create a second environment, then kill -9 the orchestrator mid-provisioning"
 
-# Start BEFORE the create: docker exec round trips are slower than the whole
-# workflow, so a poll-per-iteration from this script would routinely miss it.
-# A single psql session inside the postgres container polls the row
-# server-side every 10 ms (\watch), streaming to a file. Once it reports a
-# running step with a live owner for the environment being created,
+# Start BEFORE the create and handshake before creating anything: docker
+# exec + psql startup latency (~100 ms) used to exceed the whole workflow,
+# so a poll-per-iteration from this script would routinely miss it. A single
+# psql session inside the postgres container polls every 10 ms (\watch),
+# streaming to a file; once it streams, the environment is created. The
+# verify step additionally holds its running window for STEP_PAUSE, so a
+# running step with a live owner is observed for many consecutive polls and
 # SIGKILL lands on an orphanable, in-flight step. A workflow that reaches
 # ready with no observed live lease fails loudly: the kill would prove
 # nothing.
 WATCH_OUT="$(mktemp -t demo-lease-watch)"
-WATCH_PID=""
-WATCH_SQL="SELECT count(*) FROM workflow_steps ws
-JOIN environments e ON e.id = ws.environment_id
-WHERE e.name = 'demo-interrupted' AND e.state NOT IN ('ready', 'failed', 'deleted', 'cancelled', 'rolled_back')
-  AND ws.state = 'running' AND ws.lease_owner <> ''"
-cleanup_watch() {
-  if [[ -n "$WATCH_PID" ]]; then
-    kill "$WATCH_PID" 2>/dev/null || true
-    wait "$WATCH_PID" 2>/dev/null || true
-  fi
-}
-trap 'cleanup_watch; cleanup' EXIT
+DEMO_NAME="demo-interrupted-$SECONDS-$$"
+# The seed row makes the watcher emit a verdict every 10 ms even before the
+# environment exists ('WAIT'), so the shell can handshake on the first WAIT
+# and create the environment only once psql is verifiably streaming — no
+# poll is ever lost to docker/psql startup latency.
+WATCH_SQL="SELECT CASE
+  WHEN e.id IS NULL THEN 'WAIT'
+  WHEN e.state = 'ready' THEN 'READY'
+  WHEN ws.id IS NOT NULL THEN 'RUNNING|' || ws.id::text || '|' || ws.attempts::text
+  ELSE 'WAIT' END
+FROM (VALUES (1)) AS seed
+LEFT JOIN environments e ON e.name = '$DEMO_NAME'
+LEFT JOIN LATERAL (SELECT id, attempts FROM workflow_steps
+  WHERE environment_id = e.id AND state = 'running' AND lease_owner <> ''
+  ORDER BY step_index LIMIT 1) ws ON true"
 ( docker compose exec -T postgres psql -U orchestrator -d orchestrator -Atq \
     >"$WATCH_OUT" 2>/dev/null <<SQL
 $WATCH_SQL
@@ -199,30 +216,57 @@ SQL
 ) &
 WATCH_PID=$!
 
-ENV2_ID="$(create_env demo-tenant demo-interrupted "demo-interrupted-e2e-$SECONDS-$$" | str_field environmentId)"
+# Handshake: do not create environment two until the watcher has streamed
+# its first WAIT, proving it is polling. STEP_PAUSE (see start_orchestrator)
+# then holds the verify step in its running window long enough that the
+# observation, the authoritative DB re-read, and the kill cannot lose the
+# race against the workflow.
+HANDSHAKE=0
+for _ in $(seq 1 200); do
+  if grep -q '^WAIT$' "$WATCH_OUT" 2>/dev/null; then HANDSHAKE=1; break; fi
+  sleep 0.05
+done
+[[ "$HANDSHAKE" == "1" ]] || { cleanup_watch; fail "lease watcher never started streaming"; }
+
+ENV2_ID="$(create_env demo-tenant "$DEMO_NAME" "demo-interrupted-e2e-$SECONDS-$$" | str_field environmentId)"
 [[ -n "$ENV2_ID" ]] || { cleanup_watch; fail "environment two was not accepted"; }
 echo "environment two: $ENV2_ID"
 
 KILLABLE=0
-for _ in $(seq 1 600); do
-  if grep -qvx '0' "$WATCH_OUT" 2>/dev/null; then
-    KILLABLE=1
-    echo "a step of $ENV2_ID now holds a live lease"
-    break
+RECLAIM_STEP_ID=""
+RECLAIM_ATTEMPTS=""
+for _ in $(seq 1 2000); do
+  OBSERVED="$(grep -E '^RUNNING\|' "$WATCH_OUT" 2>/dev/null | tail -n 1 || true)"
+  if [[ -n "$OBSERVED" ]]; then
+    # Freeze the process immediately, then read the authoritative current row.
+    # The watcher line may already be stale by the time this shell is scheduled;
+    # SIGSTOP prevents a subsequent step from finishing during confirmation.
+    kill -STOP "$ORCH_PID" 2>/dev/null || true
+    RUNNING_ROW="$(psql_admin -c "SELECT ws.id || '|' || ws.attempts FROM workflow_steps ws JOIN environments e ON e.id = ws.environment_id WHERE e.id = '$ENV2_ID' AND ws.state = 'running' AND ws.lease_owner <> '' ORDER BY ws.step_index LIMIT 1")"
+    if [[ -n "$RUNNING_ROW" ]]; then
+      IFS='|' read -r RECLAIM_STEP_ID RECLAIM_ATTEMPTS <<< "$RUNNING_ROW"
+      [[ -n "$RECLAIM_STEP_ID" && "$RECLAIM_ATTEMPTS" =~ ^[0-9]+$ ]] ||
+        fail "database reported an invalid running-step record: $RUNNING_ROW"
+      KILLABLE=1
+      kill -9 "$ORCH_PID" 2>/dev/null || true
+      wait "$ORCH_PID" 2>/dev/null || true
+      ORCH_PID=""
+      break
+    fi
+    # A stale watcher row can race a fast step completion. Resume the process
+    # and keep watching rather than falsely claiming a successful fault test.
+    kill -CONT "$ORCH_PID" 2>/dev/null || true
   fi
-  [[ "$(env_state "$ENV2_ID")" != "ready" ]] || break
-  sleep 0.05
+  # The server-side watcher reports READY once this exact run is already ready;
+  # fail immediately rather than waiting out the full observation window.
+  grep -q '^READY$' "$WATCH_OUT" 2>/dev/null && break
+  sleep 0.001
 done
 cleanup_watch
 [[ "$KILLABLE" == "1" ]] ||
   fail "no step of environment two was observed holding a live lease before it reached ready; killing now proves nothing"
 
-echo "environment two is mid-provisioning with a held lease; sending SIGKILL to the orchestrator"
-LEASES_BEFORE="$(metrics_counter provisioning_lease_expirations_total)"
-kill -9 "$ORCH_PID" 2>/dev/null || true
-wait "$ORCH_PID" 2>/dev/null || true
-ORCH_PID=""
-echo "orchestrator killed while $ENV2_ID was provisioning"
+echo "orchestrator killed immediately after observing a live step lease for $ENV2_ID"
 
 stepn "5/7 restart; the orphaned step's lease expires and it is re-executed"
 start_orchestrator
@@ -232,12 +276,13 @@ echo "waiting for the stale lease (≤ ${DEMO_LEASE_DURATION}) to be reclaimed a
 wait_env_ready "$ENV2_ID" 60 || fail "environment two never reached ready after the crash"
 echo "environment two reached ready after restart"
 
-# The recovery is only proven observable if the lease-expiration counter moved:
-# the reclaim that re-executed the orphaned step must be counted.
-LEASES_AFTER="$(metrics_counter provisioning_lease_expirations_total)"
-[[ "${LEASES_AFTER:-0}" -gt "${LEASES_BEFORE:-0}" ]] ||
-  fail "provisioning_lease_expirations_total did not grow after restart (before=$LEASES_BEFORE after=$LEASES_AFTER); the reclaim that recovered the SIGKILL was not counted"
-echo "lease expiration counter grew ($LEASES_BEFORE -> $LEASES_AFTER): the reclaim was counted"
+# The process-local counter resets on SIGKILL, so prove recovery from the
+# durable attempt count captured before the kill instead of comparing metrics
+# across process lifetimes.
+ATTEMPTS_AFTER="$(psql_admin -c "SELECT attempts FROM workflow_steps WHERE id = '$RECLAIM_STEP_ID'")"
+[[ "$ATTEMPTS_AFTER" =~ ^[0-9]+$ && "$ATTEMPTS_AFTER" -gt "$RECLAIM_ATTEMPTS" ]] ||
+  fail "the orphaned step was not reclaimed (step=$RECLAIM_STEP_ID attempts=$RECLAIM_ATTEMPTS->$ATTEMPTS_AFTER)"
+echo "orphaned step $RECLAIM_STEP_ID was reclaimed (attempts $RECLAIM_ATTEMPTS -> $ATTEMPTS_AFTER)"
 
 read -r DB2 ROLE2 PASS2 < <(credentials_for "$ENV2_ID" | {
   python3 -c 'import json, sys
@@ -264,12 +309,15 @@ cat <<EOF
 
 Traces and metrics produced by this run:
   traces            one trace per environment provisioning, one span per
-                    step attempt, exported OTLP to localhost:4317 (see the
-                    compose otel-collector; a local Jaeger/Grafana Tempo can
-                    point its OTLP receiver there as well)
+                    step attempt, exported OTLP to the compose
+                    otel-collector on localhost:4317; inspect them in the
+                    collector's debug exporter output
+                    (docker compose logs otel-collector), or point a local
+                    Jaeger/Grafana Tempo at that OTLP receiver
   raw metrics       curl http://localhost:8080/metrics
-                    provisioning_lease_expirations_total counted the reclaim
-                    that recovered the SIGKILL above (asserted in step 5/6)
+                    lease-expiration counters are process-local and reset on
+                    restart; durable reclaim proof is the step attempt count
+                    printed in step 5
   prometheus        http://localhost:9090
   grafana dashboard deploy/dashboard.json (datasource: Prometheus on :9090)
   runbook           docs/runbook.md

@@ -74,17 +74,47 @@ func newFakeStore(now func() time.Time, steps ...domain.Step) *fakeStore {
 func (f *fakeStore) claimableID() int {
 	now := f.clock().UTC()
 	for i, s := range f.steps {
+		claimable := false
 		switch {
 		case s.State == domain.StepPending:
-			return i
+			claimable = true
 		case s.State == domain.StepRunning && s.LeaseExpiresAt != "":
 			exp, err := parseLease(s.LeaseExpiresAt)
 			if err == nil && exp.Before(now) {
-				return i
+				claimable = true
 			}
 		}
+		if !claimable {
+			continue
+		}
+		// Forward rows for one environment are strictly sequential. A later
+		// row cannot become work while any lower-indexed forward row is not
+		// done, matching the Postgres claim predicate.
+		if s.EnvironmentID != "" && !isCleanupStep(s.Kind) {
+			blocked := false
+			for _, prev := range f.steps {
+				if prev.EnvironmentID == s.EnvironmentID && prev.StepIndex < s.StepIndex &&
+					!isCleanupStep(prev.Kind) && prev.State != domain.StepDone {
+					blocked = true
+					break
+				}
+			}
+			if blocked {
+				continue
+			}
+		}
+		return i
 	}
 	return -1
+}
+
+func isCleanupStep(kind domain.StepKind) bool {
+	for _, cleanup := range domain.CleanupPlan {
+		if cleanup == kind {
+			return true
+		}
+	}
+	return false
 }
 
 // ClaimNextStep claims the oldest claimable step exactly as the SQL does.

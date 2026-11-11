@@ -252,6 +252,9 @@ const claimableWhere = `((ws.state = 'pending'
     AND ((ws.kind NOT IN %[1]s
             AND NOT EXISTS (SELECT 1 FROM workflow_steps cw
                 WHERE cw.environment_id = e.id AND cw.kind IN %[1]s))
+            AND NOT EXISTS (SELECT 1 FROM workflow_steps pf
+                WHERE pf.environment_id = e.id AND pf.kind NOT IN %[1]s
+                      AND pf.step_index < ws.step_index AND pf.state <> 'done')
         OR (ws.kind IN %[1]s AND e.state IN ('cancelling', 'deleting', 'failed')
             AND NOT EXISTS (SELECT 1 FROM workflow_steps fw
                 WHERE fw.environment_id = e.id AND fw.kind NOT IN %[1]s

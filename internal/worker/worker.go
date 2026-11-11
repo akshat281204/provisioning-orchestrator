@@ -116,6 +116,16 @@ type Pool struct {
 	// lease expirations, reconciliation verdicts, in_doubt counts, and the
 	// provisioning/cleanup duration series. nil disables all of them.
 	Tele *telemetry.Metrics
+	// StepPause holds a claimed step inside its running window before the
+	// executor runs, for the step kinds listed in StepPauseKinds (empty
+	// means every kind). Zero disables it. It exists only so the
+	// failure-recovery demo can intercept a running step deterministically
+	// instead of racing the millisecond-scale workflow; real deployments
+	// leave it zero. The heartbeat keeps the lease alive throughout, so the
+	// paused step is exactly the recoverable artifact the demo kills.
+	StepPause time.Duration
+	// StepPauseKinds limits StepPause to these step kinds.
+	StepPauseKinds []string
 	// Log is optional; a discard logger is used when nil.
 	Log *slog.Logger
 }
@@ -158,6 +168,23 @@ func (p *Pool) getInterval() time.Duration {
 
 // getMaxAttempts resolves the retry cap; zero or less disables scheduling.
 func (p *Pool) getMaxAttempts() int { return p.RetryPolicy.MaxAttempts }
+
+// pauseFor resolves the pre-execution pause for one step kind. An empty
+// kind list pauses every kind.
+func (p *Pool) pauseFor(kind domain.StepKind) time.Duration {
+	if p.StepPause <= 0 {
+		return 0
+	}
+	if len(p.StepPauseKinds) == 0 {
+		return p.StepPause
+	}
+	for _, k := range p.StepPauseKinds {
+		if k == string(kind) {
+			return p.StepPause
+		}
+	}
+	return 0
+}
 
 // getBackoffs resolves the base and capped-maximum backoff.
 func (p *Pool) getBackoffs() (base, max time.Duration) {
@@ -354,6 +381,17 @@ func (p *Pool) execute(ctx context.Context, log *slog.Logger, owner string, step
 
 	stopHeartbeat := p.startHeartbeat(execCtx, owner, step.ID, log)
 	defer stopHeartbeat()
+
+	// The demo's deterministic pause: the step is claimed, heartbeating,
+	// and running for at least the pause, so an external observer
+	// (scripts/failure-recovery-demo.sh) reliably sees the live lease and
+	// can kill the process with the step mid-flight. Zero in production.
+	if pause := p.pauseFor(step.Kind); pause > 0 {
+		select {
+		case <-time.After(pause):
+		case <-execCtx.Done():
+		}
+	}
 
 	execErr := p.Executor.Execute(execCtx, step)
 	// Heartbeat must stop before the outcome is recorded so the lease is

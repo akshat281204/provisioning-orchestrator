@@ -59,10 +59,12 @@ func newWorkerPool(
 	// the store's CompleteVerification transaction can write `ready`.
 	st := store.NewPostgresStore(pool)
 	return &worker.Pool{
-		Concurrency:   cfg.WorkerConcurrency,
-		LeaseDuration: cfg.LeaseDuration,
-		StepTimeout:   cfg.StepTimeout,
-		Store:         st,
+		Concurrency:    cfg.WorkerConcurrency,
+		LeaseDuration:  cfg.LeaseDuration,
+		StepTimeout:    cfg.StepTimeout,
+		StepPause:      cfg.StepPause,
+		StepPauseKinds: cfg.StepPauseKinds,
+		Store:          st,
 		// Reconciliation of in_doubt steps: the read-only probes ask the
 		// same adapters the executor drives, minus every mutating call,
 		// so "looking" can never become "doing".

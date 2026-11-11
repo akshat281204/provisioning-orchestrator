@@ -109,7 +109,7 @@ func traceRequests(tracer trace.Tracer, next http.Handler) http.Handler {
 			attribute.String("http.method", boundedLabel(r.Method)),
 			attribute.String("http.route", routePrefix(r.URL.Path)),
 		}
-		ctx, span := tracer.Start(ctx, "http "+RedactText(r.Method),
+		ctx, span := tracer.Start(ctx, "http "+boundedLabel(r.Method),
 			trace.WithSpanKind(trace.SpanKindServer),
 			trace.WithAttributes(attrs...))
 		defer span.End()

@@ -364,34 +364,17 @@ func TestClaimNextStepLeaseSemantics(t *testing.T) {
 	seedEnvWithPlan(t, st, 3)
 	const lease = 10 * time.Minute
 
-	// Steps 1 and 2 come out in step_index order, both running under w1.
-	for i := 1; i <= 2; i++ {
-		s, err := st.ClaimNextStep(ctx, "w1", lease)
-		if err != nil {
-			t.Fatalf("claim %d: %v", i, err)
-		}
-		if s.StepIndex != i {
-			t.Fatalf("claim %d returned step_index %d — claims must follow step_index order", i, s.StepIndex)
-		}
-		if s.Attempts != 1 || s.LeaseOwner != "w1" {
-			t.Fatalf("claim did not advance ownership: %+v", s)
-		}
+	// The forward plan is sequential: a live step 1 lease blocks step 2.
+	s1, err := st.ClaimNextStep(ctx, "w1", lease)
+	if err != nil || s1.StepIndex != 1 || s1.Attempts != 1 || s1.LeaseOwner != "w1" {
+		t.Fatalf("claim step 1 = (%+v, %v)", s1, err)
 	}
-	// Step 3 goes to w2 — w1's live leases on 1 and 2 are invisible.
-	s3, err := st.ClaimNextStep(ctx, "w2", lease)
-	if err != nil {
-		t.Fatalf("claim step 3: %v", err)
-	}
-	if s3.StepIndex != 3 || s3.LeaseOwner != "w2" {
-		t.Fatalf("claim 3 = (%d, %s), want (3, w2)", s3.StepIndex, s3.LeaseOwner)
+	if _, err := st.ClaimNextStep(ctx, "w2", lease); !errors.Is(err, store.ErrNoWork) {
+		t.Fatalf("a running predecessor must block later forward work, got %v", err)
 	}
 
-	// Queue drained: ErrNoWork.
-	if _, err := st.ClaimNextStep(ctx, "w3", lease); !errors.Is(err, store.ErrNoWork) {
-		t.Fatalf("expected ErrNoWork on an empty queue, got %v", err)
-	}
-
-	// Unless a lease expires: then the running step is reclaimable.
+	// An expired lease is reclaimed with an incremented attempt, then only
+	// after its durable completion may step 2 and step 3 be claimed.
 	if _, err := pool.Exec(ctx, `
 UPDATE workflow_steps
 SET lease_expires_at = now() - interval '1 second'
@@ -399,12 +382,30 @@ WHERE step_index = 1`); err != nil {
 		t.Fatalf("expire step 1's lease: %v", err)
 	}
 	reclaimed, err := st.ClaimNextStep(ctx, "w3", lease)
-	if err != nil {
+	if err != nil || reclaimed.StepIndex != 1 {
 		t.Fatalf("reclaim after expiry: %v", err)
 	}
-	if reclaimed.StepIndex != 1 || reclaimed.LeaseOwner != "w3" || reclaimed.Attempts != 2 {
+	if reclaimed.LeaseOwner != "w3" || reclaimed.Attempts != 2 || !reclaimed.Reclaimed {
 		t.Fatalf("reclaim = (%d, %s, attempts %d), want (1, w3, 2)",
 			reclaimed.StepIndex, reclaimed.LeaseOwner, reclaimed.Attempts)
+	}
+	if err := st.CompleteStep(ctx, reclaimed.ID, "w3", domain.StepDone, ""); err != nil {
+		t.Fatalf("complete step 1: %v", err)
+	}
+	for _, tc := range []struct {
+		index int
+		owner string
+	}{{2, "w1"}, {3, "w2"}} {
+		s, err := st.ClaimNextStep(ctx, tc.owner, lease)
+		if err != nil || s.StepIndex != tc.index {
+			t.Fatalf("claim step %d = (%+v, %v)", tc.index, s, err)
+		}
+		if err := st.CompleteStep(ctx, s.ID, tc.owner, domain.StepDone, ""); err != nil {
+			t.Fatalf("complete step %d: %v", tc.index, err)
+		}
+	}
+	if _, err := st.ClaimNextStep(ctx, "w3", lease); !errors.Is(err, store.ErrNoWork) {
+		t.Fatalf("expected ErrNoWork on a completed plan, got %v", err)
 	}
 }
 
@@ -419,9 +420,13 @@ func TestConcurrentClaimsAreUniqueOnRealSQL(t *testing.T) {
 	ctx := context.Background()
 
 	planLen := len(domain.Plan())
-	seedEnvWithPlan(t, st, planLen)
-
 	const claimers = 12
+	// Each environment contributes one independently claimable head step. A
+	// single environment's forward plan is intentionally sequential; this test
+	// exercises cross-environment row-lock exclusivity, not step parallelism.
+	for i := 0; i < claimers; i++ {
+		seedEnvWithPlan(t, st, planLen)
+	}
 	type result struct {
 		id  string
 		err error
@@ -457,9 +462,9 @@ func TestConcurrentClaimsAreUniqueOnRealSQL(t *testing.T) {
 			t.Fatalf("unexpected claim error: %v", r.err)
 		}
 	}
-	if noWork != claimers-planLen || len(ids) != planLen {
+	if noWork != 0 || len(ids) != claimers {
 		t.Fatalf("got %d claims / %d ErrNoWork, want %d / %d",
-			len(ids), noWork, planLen, claimers-planLen)
+			len(ids), noWork, claimers, 0)
 	}
 }
 
