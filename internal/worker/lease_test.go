@@ -100,6 +100,27 @@ func TestLiveLeaseIsNotClaimableExpiredLeaseIs(t *testing.T) {
 	}
 }
 
+func TestForwardStepsWaitForEarlierStepCompletion(t *testing.T) {
+	first, second := step("env-step-1", 1), step("env-step-2", 2)
+	first.EnvironmentID, second.EnvironmentID = "env-sequential", "env-sequential"
+	st := newFakeStore(nil, first, second)
+
+	claimed, err := st.ClaimNextStep(context.Background(), "worker-1", time.Minute)
+	if err != nil || claimed.StepIndex != 1 {
+		t.Fatalf("first claim = (%+v, %v), want step 1", claimed, err)
+	}
+	if _, err := st.ClaimNextStep(context.Background(), "worker-2", time.Minute); !errors.Is(err, store.ErrNoWork) {
+		t.Fatalf("later forward work must wait for its predecessor, got %v", err)
+	}
+	if err := st.CompleteStep(context.Background(), claimed.ID, "worker-1", domain.StepDone, ""); err != nil {
+		t.Fatalf("complete first step: %v", err)
+	}
+	claimed, err = st.ClaimNextStep(context.Background(), "worker-2", time.Minute)
+	if err != nil || claimed.StepIndex != 2 {
+		t.Fatalf("second claim = (%+v, %v), want step 2 after step 1 is done", claimed, err)
+	}
+}
+
 // TestConcurrentClaimsAreExclusive races more concurrent claimers than there
 // are claimable steps against the fake store's mutex (the stand-in for FOR
 // UPDATE SKIP LOCKED): every successful claim hands out a distinct step —

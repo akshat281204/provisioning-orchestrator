@@ -40,6 +40,12 @@ type Step struct {
 	LastError    string
 	CreatedAt    string
 	UpdatedAt    string
+	// Reclaimed is a claim-path flag, not persisted state: it reports that
+	// the pre-claim state was `running` on an owner whose lease had
+	// expired — the observable signature of a dead worker. Ordinary
+	// pending claims leave it false, so a counter may distinguish real
+	// worker deaths from routine execution.
+	Reclaimed bool
 }
 
 // OperationKey builds the stable operation-key string for a step. It contains

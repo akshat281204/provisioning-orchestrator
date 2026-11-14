@@ -3,6 +3,9 @@ package worker_test
 import (
 	"context"
 	"errors"
+	"fmt"
+	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -10,6 +13,7 @@ import (
 	"github.com/akshat281204/provisioning-orchestrator/internal/adapters"
 	"github.com/akshat281204/provisioning-orchestrator/internal/domain"
 	"github.com/akshat281204/provisioning-orchestrator/internal/store"
+	"github.com/akshat281204/provisioning-orchestrator/internal/telemetry"
 	"github.com/akshat281204/provisioning-orchestrator/internal/worker"
 )
 
@@ -398,4 +402,108 @@ func TestFailedStepAtCapStaysFailedWithoutScheduling(t *testing.T) {
 	if len(st.retryBackoffs) != 0 {
 		t.Fatalf("a step at the cap must never be re-scheduled, scheduled %d times", len(st.retryBackoffs))
 	}
+}
+
+// provisioningFailedDurations scrapes the /metrics exposition for the number
+// of observations on the provisioning_duration_seconds{outcome="failed"}
+// series (absent means 0).
+func provisioningFailedDurations(t *testing.T, tele *telemetry.Metrics) int {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/metrics", nil)
+	tele.Handler().ServeHTTP(rec, req)
+	for _, l := range strings.Split(rec.Body.String(), "\n") {
+		if strings.HasPrefix(l, `provisioning_duration_seconds_count{outcome="failed"}`) {
+			var n int
+			if _, err := fmt.Sscanf(l, `provisioning_duration_seconds_count{outcome="failed"} %d`, &n); err != nil {
+				t.Fatalf("unparsable failed-duration exposition %q: %v", l, err)
+			}
+			return n
+		}
+	}
+	return 0
+}
+
+// TestReconciledFailureWithRetryBudgetEmitsNoFailedDuration pins the
+// phase-8 blocking fix: a reconcile `failed` verdict on a step that still
+// has retry budget is NOT terminal — the resume sweep re-schedules it — so
+// no failed duration may be emitted until the budget is exhausted. A step
+// reconciled failed at the cap emits exactly one.
+func TestReconciledFailureWithRetryBudgetEmitsNoFailedDuration(t *testing.T) {
+	t.Run("retry-budget-left", func(t *testing.T) {
+		s := inDoubtStep("reconcile-retryable", 1, domain.KindCreateDatabase)
+		s.CreatedAt = time.Now().UTC().Format(time.RFC3339)
+		st := newFakeStore(nil, s)
+		tele := telemetry.NewMetrics()
+		pool := &worker.Pool{
+			LeaseDuration: time.Minute,
+			StepTimeout:   time.Minute,
+			Store:         st,
+			Executor:      worker.NoopExecutor{},
+			Reconciler:    &scriptedReconciler{outcome: adapters.OutcomeFailed},
+			Tele:          tele,
+			RetryPolicy:   worker.RetryPolicy{MaxAttempts: 3, BaseBackoff: time.Hour},
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		done := startPool(ctx, pool)
+
+		deadline := time.Now().Add(3 * time.Second)
+		for time.Now().Before(deadline) {
+			st.mu.Lock()
+			scheduled := len(st.retryBackoffs) == 1
+			st.mu.Unlock()
+			if scheduled {
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		stopPool(t, cancel, done)
+
+		st.mu.Lock()
+		scheduled := len(st.retryBackoffs) == 1
+		st.mu.Unlock()
+		if !scheduled {
+			t.Fatal("the resume sweep must re-schedule a reconcile-failed step under the cap")
+		}
+		if n := provisioningFailedDurations(t, tele); n != 0 {
+			t.Fatalf("a re-scheduled reconcile failure must emit no failed duration, got %d", n)
+		}
+	})
+
+	t.Run("budget-exhausted", func(t *testing.T) {
+		s := inDoubtStep("reconcile-exhausted", 1, domain.KindCreateDatabase)
+		s.CreatedAt = time.Now().UTC().Format(time.RFC3339)
+		s.Attempts = 3
+		st := newFakeStore(nil, s)
+		tele := telemetry.NewMetrics()
+		pool := &worker.Pool{
+			LeaseDuration: time.Minute,
+			StepTimeout:   time.Minute,
+			Store:         st,
+			Executor:      worker.NoopExecutor{},
+			Reconciler:    &scriptedReconciler{outcome: adapters.OutcomeFailed},
+			Tele:          tele,
+			RetryPolicy:   worker.RetryPolicy{MaxAttempts: 3, BaseBackoff: time.Hour},
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		done := startPool(ctx, pool)
+
+		deadline := time.Now().Add(3 * time.Second)
+		for time.Now().Before(deadline) {
+			if n := provisioningFailedDurations(t, tele); n > 0 {
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		stopPool(t, cancel, done)
+
+		st.mu.Lock()
+		defer st.mu.Unlock()
+		if len(st.retryBackoffs) != 0 {
+			t.Fatalf("a step at the cap must not be re-scheduled, got %d", len(st.retryBackoffs))
+		}
+		if n := provisioningFailedDurations(t, tele); n != 1 {
+			t.Fatalf("an exhausted reconcile failure must emit exactly one failed duration, got %d", n)
+		}
+	})
 }

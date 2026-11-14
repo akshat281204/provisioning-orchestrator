@@ -22,6 +22,7 @@ import (
 	"github.com/akshat281204/provisioning-orchestrator/internal/adapters"
 	"github.com/akshat281204/provisioning-orchestrator/internal/domain"
 	"github.com/akshat281204/provisioning-orchestrator/internal/store"
+	"github.com/akshat281204/provisioning-orchestrator/internal/telemetry"
 )
 
 // isCleanupKind reports whether kind belongs to the durable cleanup plan
@@ -63,6 +64,17 @@ func (p *Pool) reconcileLoop(ctx context.Context, log *slog.Logger, owner string
 // cleanup finalizer and the capped retry scheduler for rows a crash ate the
 // follow-up on), until the store stops answering or the context ends.
 func (p *Pool) reconcilePass(ctx context.Context, log *slog.Logger, owner string) {
+	// The steps_in_doubt gauge is swept from the rows, not incremented
+	// locally: a restart must publish the truth it inherits, not forget it.
+	if counter, ok := p.Store.(interface {
+		CountStepsInDoubt(context.Context) (int64, error)
+	}); ok {
+		if n, err := counter.CountStepsInDoubt(ctx); err != nil {
+			log.Warn("worker reconciliation could not sweep the in_doubt gauge", "err", err)
+		} else {
+			p.Tele.SetStepsInDoubt(n)
+		}
+	}
 	if _, err := p.Store.ReapExpiredReconciliations(ctx); err != nil {
 		log.Warn("worker reconciliation could not reap abandoned claims", "err", err)
 	}
@@ -190,8 +202,35 @@ func (p *Pool) recordReconcileOutcome(
 		log.Error("worker reconciliation could not record the outcome",
 			"step_id", step.ID, "state", state, "err", err)
 	}
-	if err == nil && state != domain.StepInDoubt && state != domain.StepFailed && isCleanupKind(step.Kind) {
+	if err != nil {
+		return // only a recorded verdict is a metric fact
+	}
+	// Phase 8: one reconciliation verdict, labelled by the decision the
+	// reconciler landed, and its latency-series consequences. A failed
+	// verdict with retry budget left is NOT terminal — the resume sweep
+	// re-schedules the step — so `final` is derived from retry eligibility,
+	// never asserted: a re-scheduled step must not emit a failed duration
+	// that a later successful or exhausted retry would double-count.
+	final := state != domain.StepFailed || !p.retryEligible(step)
+	p.Tele.ObserveReconciliation(ctx, reconcileDecisionFor(state))
+	p.observeStepOutcome(ctx, step, state, final, outcomeFromReconcile)
+	if state != domain.StepInDoubt && state != domain.StepFailed && isCleanupKind(step.Kind) {
 		p.maybeFinalizeCleanup(nctx, log, step)
+	}
+}
+
+// reconcileDecisionFor maps the recorded step state onto the bounded
+// reconcile-decision label domain.
+func reconcileDecisionFor(state domain.StepState) string {
+	switch state {
+	case domain.StepDone:
+		return telemetry.DecisionDone
+	case domain.StepPending:
+		return telemetry.DecisionPending
+	case domain.StepFailed:
+		return telemetry.DecisionFailed
+	default:
+		return telemetry.DecisionUnobservable
 	}
 }
 
@@ -209,15 +248,23 @@ func (p *Pool) maybeFinalizeCleanup(ctx context.Context, log *slog.Logger, step 
 	}
 }
 
-// maybeScheduleRetry reschedules a just-failed step for another attempt
-// while its persisted attempts are under the cap. The cap is read from the
-// claimed row (step.Attempts): a retry the worker died before scheduling is
-// never remembered locally, so the budget is the ROW's, and a step that
-// exhausted it stays failed for an operator instead of looping forever.
-func (p *Pool) maybeScheduleRetry(ctx context.Context, log *slog.Logger, step domain.Step) {
+// retryEligible reports whether the row still has retry budget left, i.e.
+// whether a failure on it is transient by construction: the resume sweep
+// (or the executor path) will schedule another attempt, so no terminal
+// duration may be recorded yet. The cap is read from the claimed row
+// (step.Attempts): a retry the worker died before scheduling is never
+// remembered locally, so the budget is the ROW's, and a step that exhausted
+// it stays failed for an operator instead of looping forever.
+func (p *Pool) retryEligible(step domain.Step) bool {
 	maxAttempts := p.getMaxAttempts()
-	if maxAttempts <= 0 || step.Attempts >= maxAttempts {
-		return // retry budget exhausted or scheduling disabled: stays failed
+	return maxAttempts > 0 && step.Attempts < maxAttempts
+}
+
+// maybeScheduleRetry reschedules a just-failed step for another attempt
+// while its persisted attempts are under the cap.
+func (p *Pool) maybeScheduleRetry(ctx context.Context, log *slog.Logger, step domain.Step) bool {
+	if !p.retryEligible(step) {
+		return false // retry budget exhausted or scheduling disabled: stays failed
 	}
 	delay := p.retryDelay(step.Attempts)
 	if err := p.Store.ScheduleRetry(context.WithoutCancel(ctx), step.ID, delay); err != nil {
@@ -226,10 +273,11 @@ func (p *Pool) maybeScheduleRetry(ctx context.Context, log *slog.Logger, step do
 		// which is the conservative direction.
 		log.Warn("worker could not schedule the step retry",
 			"step_id", step.ID, "delay", delay, "err", err)
-		return
+		return false
 	}
 	log.Info("worker scheduled a step retry",
-		"step_id", step.ID, "attempts", step.Attempts, "max_attempts", maxAttempts, "delay", delay)
+		"step_id", step.ID, "attempts", step.Attempts, "max_attempts", p.getMaxAttempts(), "delay", delay)
+	return true
 }
 
 // retryDelay shapes the durable backoff for the attempt that just failed:

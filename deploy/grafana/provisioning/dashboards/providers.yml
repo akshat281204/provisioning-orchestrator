@@ -1,0 +1,14 @@
+apiVersion: 1
+
+# The provisioning-orchestrator dashboard is provisioned from the repository's
+# deploy/ directory, so a local `docker compose up` shows it with no manual
+# import. Refresh only: the JSON is read from disk on each restart.
+providers:
+  - name: provisioning-orchestrator
+    folder: Provisioning Orchestrator
+    type: file
+    disableDelete: false
+    updateIntervalSeconds: 30
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards

@@ -24,18 +24,44 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Telemetry is the last thing to leave: shutdown flushes any queued
+	// spans/metric batches to the collector. With no collector configured
+	// the providers are no-ops and this is a free call.
+	shutdown, err := telemetry.Setup(cfg.OTLPEndpoint)
+	if err != nil {
+		log.Error("failed to start telemetry", "err", err)
+		os.Exit(1)
+	}
+	defer func() {
+		shutdownTelemetry(shutdown, log)
+	}()
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	app, err := app.New(ctx, cfg, log)
 	if err != nil {
 		log.Error("failed to start service", "err", err)
+		shutdownTelemetry(shutdown, log)
 		os.Exit(1)
 	}
 
 	if err := app.Run(ctx); err != nil {
 		log.Error("service stopped with error", "err", err)
+		shutdownTelemetry(shutdown, log)
 		os.Exit(1)
 	}
 	log.Info("stopped cleanly")
+}
+
+// shutdownTelemetry flushes queued spans and metric batches, bounded by
+// ShutdownTimeout. It runs on every exit path — including the error exits in
+// main — because os.Exit bypasses deferred calls and would otherwise drop
+// whatever telemetry the failed run produced.
+func shutdownTelemetry(shutdown func(context.Context) error, log *slog.Logger) {
+	ctx, cancel := context.WithTimeout(context.Background(), telemetry.ShutdownTimeout)
+	defer cancel()
+	if err := shutdown(ctx); err != nil {
+		log.Warn("telemetry shutdown incomplete", "err", err)
+	}
 }

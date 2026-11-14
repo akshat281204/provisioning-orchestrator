@@ -19,7 +19,12 @@ type Config struct {
 	VaultAddr string
 	// VaultToken authenticates to Vault. In dev this is the root token.
 	VaultToken string
-	// OTLPEndpoint receives OpenTelemetry traces and metrics.
+	// OTLPEndpoint receives OpenTelemetry traces and metrics. Empty means no
+	// collector is configured: the trace and metric providers degrade to
+	// no-ops, so the service runs (and provisions) at full speed with no
+	// collector listening anywhere. Default: unset — run with the
+	// docker-compose collector by exporting
+	// OTEL_EXPORTER_OTLP_ENDPOINT=localhost:4317.
 	OTLPEndpoint string
 	// WorkerConcurrency is how many provisioning steps may run at once.
 	WorkerConcurrency int
@@ -35,6 +40,14 @@ type Config struct {
 	// ShutdownTimeout bounds graceful shutdown: draining in-flight requests
 	// and closing dependencies.
 	ShutdownTimeout time.Duration
+	// StepPause is a deterministic pause applied before executing a step
+	// kind (zero disables it). It exists only so the failure-recovery demo
+	// can hold a step inside its running window and intercept the process
+	// reliably; real deployments leave it zero.
+	StepPause time.Duration
+	// StepPauseKinds limits StepPause to these step kinds. An empty list
+	// pauses every kind.
+	StepPauseKinds []string
 	// CredentialCallers is the explicit caller-identity allowlist of the
 	// credential retrieval and rotation endpoints. This is a minimal policy
 	// (see phase 6 out-of-scope notes): any real deployment must front it
@@ -49,7 +62,7 @@ func Load() (Config, error) {
 		DatabaseURL:            env("DATABASE_URL", "postgres://orchestrator:orchestrator@localhost:5432/orchestrator?sslmode=disable"),
 		VaultAddr:              env("VAULT_ADDR", "http://localhost:8200"),
 		VaultToken:             env("VAULT_TOKEN", "root"),
-		OTLPEndpoint:           env("OTEL_EXPORTER_OTLP_ENDPOINT", "localhost:4317"),
+		OTLPEndpoint:           env("OTEL_EXPORTER_OTLP_ENDPOINT", ""),
 		WorkerConcurrency:      4,
 		StepTimeout:            30 * time.Second,
 		LeaseDuration:          90 * time.Second,
@@ -73,6 +86,12 @@ func Load() (Config, error) {
 	}
 	if c.ShutdownTimeout, err = envDuration("SHUTDOWN_TIMEOUT", c.ShutdownTimeout); err != nil {
 		return Config{}, err
+	}
+	if c.StepPause, err = envDuration("STEP_PAUSE", 0); err != nil {
+		return Config{}, err
+	}
+	if v, ok := envCSV("STEP_PAUSE_KINDS", nil); ok {
+		c.StepPauseKinds = v
 	}
 
 	if v, ok := envCSV("CREDENTIAL_RETRIEVAL_CALLERS", c.CredentialCallers); ok {
@@ -109,6 +128,14 @@ func (c Config) Validate() error {
 	}
 	if c.ShutdownTimeout <= 0 {
 		return fmt.Errorf("config: shutdown timeout must be positive, got %s", c.ShutdownTimeout)
+	}
+	// A pause consuming the whole step timeout would make every paused step
+	// deterministically ambiguous, which is never the intent of the hook.
+	if c.StepPause >= c.StepTimeout {
+		return fmt.Errorf(
+			"config: step pause (%s) must stay below the step timeout (%s) or every paused step would time out",
+			c.StepPause, c.StepTimeout,
+		)
 	}
 	return nil
 }
