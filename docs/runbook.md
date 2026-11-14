@@ -204,3 +204,49 @@ rate(provisioning_duration_seconds_count{outcome="failed"}[10m]) > 0
 ```
 
 (Alertmanager routing itself is out of scope for this phase.)
+
+---
+
+## Fault scenarios as operational drills (phase 9)
+
+Every procedure above was exercised while building the fault scenarios in
+[`test/faults/`](../test/faults) — one test per failure case, each asserting
+the persisted workflow state **and** the resulting external resources. They
+double as repeatable drills: run `make test-faults` and the service's
+recovery claims are re-proven against the live stack after any change.
+
+What the scenarios confirmed, and the operational procedure each one backs:
+
+| Scenario (test) | Drill | Confirmed procedure |
+| --- | --- | --- |
+| 1 — database created, response lost (`TestFault1…`) | Worker dies after `CREATE DATABASE`, before recording | Do nothing but keep a worker alive: lease expiry + idempotent re-run converge; verify with `pg_database` count = 1 and `attempts = 2` on the row |
+| 2 — crash after role creation (`TestFault2…`) | Same shape, one step later | Same procedure; `pg_roles` count = 1, then the credential must actually connect |
+| 3 — late/duplicate readiness (`TestFault3…`) | Verification completes (or tries to) after cancel | A late `ready` cannot win over cancellation; if a cancelled env ever reports `ready`, that is a P1 bug, not an operational state. Cleanup still ends `cancelled` with zero resources |
+| 4 — partial grant failure (`TestFault4…`) | GRANT lands, second GRANT does not | Bounded retry absorbs it; after recovery, prove the grant externally by connecting as the role, not by reading state |
+| 5 — Vault outage mid-provisioning (`TestFault5…`) | Secrets service down after database creation | Wait for Vault and let the retry policy run; the database is not duplicated and the secret is stored only when Vault accepts it. `attempts` on the row records the outage |
+| 6 — last capacity slot race (`TestFault6…`) | Two creations, one slot | Exactly one wins; the loser rests `failed` after its full persisted retry budget and an operator cancels it (`POST /cancel`); never raise the limit to "unstick" a loser — release slots by cleaning environments |
+| 7 — partial cleanup then failure (`TestFault7…`) | Drop succeeds, next drop fails once | The partial success is durable and visible (`pg_database` is already 0 while `drop_role` retries); the workflow re-arms and finishes `deleted`. See "Recovering a failed cleanup" above |
+| 8 — rotation commit lost (`TestFault8…`) | Rotation applied remotely, response lost | The env stays `rotating`; simply retry `POST /rotate`. Verify exactly one live Vault version (`StoredVersions`), the audit log on the verify step, and that only the published password connects |
+| 9 — lease expiry with delayed worker (`TestFault9…`) | Slow worker vs. reclaim | The stale completion is fenced out by the lease owner guard; a duplicate resource here would be a P1. The row's `attempts = 2` is the audit trail |
+| 10 — unauthorized credential access (`TestFault10…`) | Wrong caller asks for a credential | 403 (401 without identity), the stored secret is untouched, and the denial is audited by caller identity. Check `curl /metrics`/logs for the audit line; investigate the caller, not the store |
+
+Two recurring operational lessons the drills forced us to encode:
+
+- **State is claimed from rows, not from responses.** Every scenario that
+  loses a response (1, 8, 9) resolves the same way: look at the persisted
+  rows and the real resources, never trust the HTTP answer alone.
+- **Terminal verdicts are earned, never forced.** `ready`, `deleted`, and
+  `cancelled` each land only through their owning transaction; when a drill
+  tries to shortcut one (3, 7), the store refuses and the honest state
+  (`rotating`, `deleting` with progress) stays visible.
+
+## Benchmarking procedure
+
+`make benchmark` runs the load profile (`test/load`) and records the result
+with the machine and configuration context — CPU, memory, Go version,
+Postgres settings (`shared_buffers`, `max_connections`, `synchronous_commit`,
+…), the load parameters, and the git commit — into `benchmark-results/`.
+Compare runs only against runs with comparable context; the numbers are
+machine-dependent (see [`evaluation.md`](evaluation.md) for what they do not
+show). The load run itself asserts the two properties that matter under
+concurrency: a 100% ready rate and zero duplicate external resources.

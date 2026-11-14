@@ -19,3 +19,6 @@
 # Agent workflow scratch (also in .git/info/exclude)
 .review/
 .stack/
+
+# Benchmark output (make benchmark writes here)
+benchmark-results/
